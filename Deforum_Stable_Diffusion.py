@@ -295,6 +295,11 @@ def blue_loss_fn(x, sigma, **kwargs):
   error = torch.abs(x[:,-1, :, :] - 0.9).mean() 
   return error
 
+# MSE loss from init
+def make_mse_loss(target):
+    def mse_loss(x, sigma, **kwargs):
+        return (x - target).square().mean()
+    return mse_loss
 
 ###
 # Conditioning helper functions
@@ -305,8 +310,6 @@ def make_cond_fn(loss_fn, scale, verbose=False):
     # loss_fn (function): func(x, sigma, denoised) -> number
     # scale (number): how much this loss is applied to the image
     def cond_fn(x, sigma, denoised, **kwargs):
-        # x = x.detach().requires_grad_()
-        # denoised = denoised.detach().requires_grad_()
         with torch.enable_grad():
             denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
@@ -641,8 +644,12 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
+    if args.init_mse_scale > 0 and init_latent is None:
+        raise Exception("Cannot use mse loss without an init image")
+
     cond_fns = [
-        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale > 0 else None
+        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale > 0 else None,
+        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, verbose=True) if args.init_mse_scale > 0 else None,
         ]
 
     callback = make_callback(sampler_name=args.sampler,
@@ -1020,6 +1027,7 @@ def DeforumArgs():
 
     #@markdown **Conditioning Settings**
     blue_loss_scale = 200 #@param {type:"number"}
+    init_mse_scale = 200 #@param {type:"number"}
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
