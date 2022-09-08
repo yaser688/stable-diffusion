@@ -155,7 +155,7 @@ class DDIMSampler(object):
                                       unconditional_conditioning=unconditional_conditioning)
             img, pred_x0 = outs
             if callback: callback(i)
-            if img_callback: img_callback(img, i)
+            if img_callback: img_callback(img, pred_x0, i)
 
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
@@ -237,10 +237,10 @@ class DDIMSampler(object):
             index = total_steps - i - 1
 
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
-            x_dec, _ = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
+            x_dec, pred_x0 = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
                                           unconditional_guidance_scale=unconditional_guidance_scale,
                                           unconditional_conditioning=unconditional_conditioning)
 
-            if img_callback: img_callback(x_dec, i)
+            if img_callback: img_callback(x_dec, pred_x0, i)
 
         return x_dec
