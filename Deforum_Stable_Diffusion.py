@@ -146,6 +146,7 @@ import py3d_tools as p3d
 from helpers import save_samples, sampler_fn
 from infer import InferenceHelper
 from k_diffusion import sampling
+from k_diffusion import utils as k_utils
 from k_diffusion.external import CompVisDenoiser
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -284,8 +285,74 @@ def maintain_colors(prev_img, color_match_sample, mode):
         matched_lab = match_histograms(prev_img_lab, color_match_lab, multichannel=True)
         return cv2.cvtColor(matched_lab, cv2.COLOR_LAB2RGB)
 
+###
+# Loss functions
+###
 
-def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, mask=None, init_latent=None, sigmas=None, sampler=None, masked_noise_modifier=1.0):  
+# blue loss from @johnowhitaker's tutorial on Grokking Stable Diffusion
+def blue_loss_fn(x, sigma, **kwargs):
+  # How far are the blue channel values to 0.9:
+  error = torch.abs(x[:,-1, :, :] - 0.9).mean() 
+  return error
+
+
+###
+# Conditioning helper functions
+###
+
+def make_cond_fn(loss_fn, scale, verbose=False):
+    # Turns a loss function into a cond function that is applied to the decoded RGB sample
+    # loss_fn (function): func(x, sigma, denoised) -> number
+    # scale (number): how much this loss is applied to the image
+    def cond_fn(x, sigma, denoised, **kwargs):
+        # x = x.detach().requires_grad_()
+        # denoised = denoised.detach().requires_grad_()
+        with torch.enable_grad():
+            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
+            grad = -torch.autograd.grad(loss, x)[0]
+        
+            verbose_print('Loss:', loss.item())
+            verbose_print("Max cond_grad", torch.max(grad))
+            verbose_print("Min cond_grad", torch.min(grad))
+        return grad
+
+    verbose_print = print if verbose else lambda *args, **kwargs: None
+    
+    return cond_fn
+
+
+def apply_grads(x, sigma, denoised, cond_fns, **kwargs):
+    # Applies gradient conditions
+    # x: noisy latent
+    # sigma: noise schedule sigma
+    # denoised: x0_pred denoised latent
+    # cond_fns: list of cond functions, each created with make_cond_fn
+    total_cond_grad = torch.zeros_like(x)
+    with torch.no_grad():
+        denoised_diff = x - denoised
+    for cond_fn in cond_fns:
+        if cond_fn is None: continue
+        with torch.enable_grad():
+            x = x.detach().requires_grad_()
+            pred_x0 = x + denoised_diff
+            cond_grad = cond_fn(x, sigma, denoised=pred_x0, **kwargs).detach()
+        total_cond_grad += cond_grad
+    guided_x0_pred = denoised.detach() + total_cond_grad * k_utils.append_dims(sigma**2, x.ndim)
+    guided_x = x.detach() + total_cond_grad * k_utils.append_dims(sigma**2, x.ndim)
+    return guided_x, guided_x0_pred
+
+
+def make_callback(sampler_name, 
+                  dynamic_threshold=None, 
+                  static_threshold=None, 
+                  mask=None, 
+                  init_latent=None, 
+                  sigmas=None, 
+                  sampler=None, 
+                  masked_noise_modifier=1.0,
+                  cond_fns=None,
+                  verbose=False):  
     # Creates the callback function to be passed into the samplers
     # The callback function is applied to the image at each step
     def dynamic_thresholding_(img, threshold):
@@ -307,9 +374,17 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
             is_masked = torch.logical_and(mask >= mask_schedule[args_dict['i']], mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + args_dict['x'] * torch.where(is_masked,0,1)
             args_dict['x'].copy_(new_img)
+        if cond_fns is not None:
+            sigma = args_dict['sigma']
+            verbose_print('sigma', sigma)
+            new_img, guided_x0_pred = apply_grads(args_dict['x'], sigma, args_dict['denoised'], cond_fns)
+            verbose_print("Max pixel change of new image",torch.max(new_img-args_dict['x']))
+            args_dict['x'].copy_(new_img)
+            args_dict['denoised'].copy_(guided_x0_pred)
+        
 
-    # Function that is called on the image (img) and step (i) at each step
-    def img_callback_(img, i):
+    # Function that is called on the image (img), denoised image (pred_x0), and step (i) at each step
+    def img_callback_(img, pred_x0, i):
         # Thresholding functions
         if dynamic_threshold is not None:
             dynamic_thresholding_(img, dynamic_threshold)
@@ -321,6 +396,18 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
             is_masked = torch.logical_and(mask >= mask_schedule[i], mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
+        if cond_fns is not None:
+            #TODO decide on a sigma schedule for 
+            # i_inv = len(sigmas) - i - 1
+            # sigma = sampler.ddim_sigmas[i_inv] # this sigma varies with eta (all zeros when ddim_eta==0)
+            # sigma = sampler.ddim_sqrt_one_minus_alphas[i_inv]
+            sigma = sigmas[i]
+            verbose_print('sigma', sigma)
+            new_img, guided_x0_pred = apply_grads(img, sigma, pred_x0, cond_fns)
+            verbose_print("Max pixel change of new image",torch.max(new_img-img))
+            img.copy_(new_img)
+            # pred_x0.copy_(guided_x0_pred) # compvis loops overwrite new pred_x0 on next step, so not needed
+        
             
               
     if init_latent is not None:
@@ -329,16 +416,18 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
         mask_schedule, _ = torch.sort(sigmas/torch.max(sigmas))
     elif len(sigmas) == 0:
         mask = None # no mask needed if no steps (usually happens because strength==1.0)
+
     if sampler_name in ["plms","ddim"]: 
         # Callback function formated for compvis latent diffusion samplers
         if mask is not None:
             assert sampler is not None, "Callback function for stable-diffusion samplers requires sampler variable"
             batch_size = init_latent.shape[0]
-
         callback = img_callback_
     else: 
         # Default callback function uses k-diffusion sampler variables
         callback = k_callback_
+    
+    verbose_print = print if verbose else lambda *args, **kwargs: None
 
     return callback
 
@@ -550,6 +639,10 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
+    cond_fns = [
+        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale > 0 else None
+        ]
+
     callback = make_callback(sampler_name=args.sampler,
                             dynamic_threshold=args.dynamic_threshold, 
                             static_threshold=args.static_threshold,
@@ -557,6 +650,8 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler)    
+
+     
 
     results = []
     precision_scope = autocast if args.precision == "autocast" else nullcontext
@@ -918,6 +1013,9 @@ def DeforumArgs():
     # Adjust mask image, 1.0 is no adjustment. Should be positive numbers.
     mask_brightness_adjust = 1.0  #@param {type:"number"}
     mask_contrast_adjust = 1.0  #@param {type:"number"}
+
+    #@markdown **Conditioning Settings**
+    blue_loss_scale = 200 #@param {type:"number"}
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 

@@ -1160,7 +1160,7 @@ class LatentDiffusion(DDPM):
             if i % log_every_t == 0 or i == timesteps - 1:
                 intermediates.append(x0_partial)
             if callback: callback(i)
-            if img_callback: img_callback(img, i)
+            if img_callback: img_callback(img, x0_partial, i)
         return img, intermediates
 
     @torch.no_grad()
@@ -1198,9 +1198,10 @@ class LatentDiffusion(DDPM):
                 tc = self.cond_ids[ts].to(cond.device)
                 cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
 
-            img = self.p_sample(img, cond, ts,
+            img, pred_x0 = self.p_sample(img, cond, ts,
                                 clip_denoised=self.clip_denoised,
-                                quantize_denoised=quantize_denoised)
+                                quantize_denoised=quantize_denoised,
+                                return_x0=True)
             if mask is not None:
                 img_orig = self.q_sample(x0, ts)
                 img = img_orig * mask + (1. - mask) * img
@@ -1208,7 +1209,7 @@ class LatentDiffusion(DDPM):
             if i % log_every_t == 0 or i == timesteps - 1:
                 intermediates.append(img)
             if callback: callback(i)
-            if img_callback: img_callback(img, i)
+            if img_callback: img_callback(img, pred_x0, i)
 
         if return_intermediates:
             return img, intermediates
