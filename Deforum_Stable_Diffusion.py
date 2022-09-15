@@ -435,10 +435,10 @@ class SamplerCallback(object):
                 TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
         if self.show_sample_per_step:
             print(path_name_modifier)
-            display_images(samples)
+            self.display_images(samples)
         return
 
-    def display_images(images):
+    def display_images(self, images):
         images = images.double().cpu().add(1).div(2).clamp(0, 1)
         images = torch.tensor(np.array(images))
         grid = make_grid(images, 4).cpu()
@@ -485,8 +485,8 @@ class SamplerCallback(object):
             args_dict['denoised'].copy_(guided_x0_pred)
 
         if self.verbose:
-            self.view_sample_step(args_dict['denoised'], "x0_pred_guided")
-            self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample_guided")
+            self.view_sample_step(args_dict['denoised'], "x0_pred")
+            self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
             if self.cond_fns is not None:
                 # self.view_sample_step(x0_pred_guided_diff, "x0_pred_guided_diff")
                 self.view_sample_step(torch.abs(model.decode_first_stage(guided_diff)*2.0) - 1.0, "guided_diff")
@@ -574,6 +574,46 @@ def transform_image_3d(prev_img_cv2, depth_tensor, rot_mat, translate, anim_args
         'c h w -> h w c'
     ).cpu().numpy().astype(prev_img_cv2.dtype)
     return result
+
+
+## CLIP -----------------------------------------
+
+class MakeCutouts(nn.Module):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
+        super().__init__()
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow
+
+    def forward(self, input):
+        sideY, sideX = input.shape[2:4]
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, self.cut_size)
+        cutouts = []
+        for _ in range(self.cutn):
+            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
+            offsetx = torch.randint(0, sideX - size + 1, ())
+            offsety = torch.randint(0, sideY - size + 1, ())
+            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
+        return torch.cat(cutouts)
+
+
+def spherical_dist_loss(x, y):
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+
+
+def clip_cond_fn(denoised, sigma, **kwargs):
+    clip_in = normalize(make_cutouts(denoised.add(1).div(2)))
+    image_embeds = clip_model.encode_image(clip_in).float()
+    dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
+    dists = dists.view([cutn, 1, -1])
+    losses = dists.mul(weights).sum(2).mean(0)
+    return losses.sum()
+
+## CLIP -----------------------------------------
 
 def generate(args, return_latent=False, return_sample=False, return_c=False):
     seed_everything(args.seed)
@@ -1045,9 +1085,7 @@ def parse_prompt(prompt):
     vals = vals + ['', '1'][len(vals):]
     return vals[0], float(vals[1])
 
-# clip_prompts = ['hyperdetailed matte illustration geometric pattern']
-clip_prompts = ["cosmic death portrait with the grim reaper's hands on her face by wlop and rebecca guay and james jean and Greg Rutkowski"]
-# clip_prompts = ["beautiful flower by wlop"]
+clip_prompts = ['hyperdetailed matte illustration geometric pattern']
 
 target_embeds, weights = [], []
 
@@ -1095,6 +1133,8 @@ def DeforumArgs():
     save_sample_per_step = True #@param {type:"boolean"}
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
+    save_sample_per_step = True #@param {type:"boolean"}
+    show_sample_per_step = True #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
     n_batch = 1 #@param
@@ -1125,7 +1165,7 @@ def DeforumArgs():
     clip_loss_scale = 100 #@param {type:"number"}
     clamp_grad_threshold = 0.01 #@param {type:"number"}
     grad_threshold_type = 'rms' #@param ["dynamic", "static", "rms"]
-    add_grad_to = 'both' #@param ["x", "x0_pred", "both"]
+    add_grad_to = 'x0_pred' #@p#aram ["x", "x0_pred", "both"]
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
@@ -1590,7 +1630,9 @@ fps = 12 #@param {type:"number"}
 #@markdown **Manual Settings**
 use_manual_settings = False #@param {type:"boolean"}
 image_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939_%05d.png" #@param {type:"string"}
-mp4_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939.mp4" #@param {type:"string"}
+mp4_path = "/content/drive/MyDrive/AI/StableDiffu'/content/drive/MyDrive/AI/StableDiffusion/2022-09/sion/2022-09/20220903000939.mp4" #@param {type:"string"}
+render_steps = True  #@param {type: 'boolean'}
+path_name_modifier = "x0_pred" #@param ["x0_pred", "x0_pred_sample", "guided_diff", "x0_pred_orig", "x0_pred_sample_orig"]
 
 
 if skip_video_for_run_all == True:
@@ -1605,9 +1647,18 @@ else:
     if use_manual_settings:
         max_frames = "200" #@param {type:"string"}
     else:
-        image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
-        mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
-        max_frames = str(anim_args.max_frames)
+        if render_steps: # render steps from a single image
+            fname = f"%03d_{path_name_modifier}.png"
+            all_step_dirs = [os.path.join(args.outdir, d) for d in os.listdir(args.outdir) if os.path.isdir(os.path.join(args.outdir,d))]
+            newest_dir = max(all_step_dirs, key=os.path.getmtime)
+            image_path = os.path.join(newest_dir, fname)
+            print(image_path)
+            mp4_path = os.path.join(newest_dir, f"{args.timestring}.mp4")
+            max_frames = str(anim_args.max_frames)
+        else: # render images for a video
+            image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
+            mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
+            max_frames = str(anim_args.max_frames)
 
     # make video
     cmd = [
@@ -1624,6 +1675,7 @@ else:
         '-pix_fmt', 'yuv420p',
         '-crf', '17',
         '-preset', 'veryfast',
+        '-pattern_type', 'sequence',
         mp4_path
     ]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

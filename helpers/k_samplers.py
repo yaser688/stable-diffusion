@@ -58,6 +58,7 @@ def sampler_fn(
     init_latent: Optional[torch.Tensor] = None,
     t_enc: Optional[torch.Tensor] = None,
     cond_fns: Optional[list] = None,
+    clamp_func: Callable[[Any], None] = None,
     device=torch.device("cpu")
     if not torch.cuda.is_available()
     else torch.device("cuda"),
@@ -80,7 +81,7 @@ def sampler_fn(
         else:
             x = torch.zeros([args.n_samples, *shape], device=device)
     sampler_args = {
-        "model": CFGDenoiserWithGrad(model_wrap, cond_fns), #CFGDenoiser(model_wrap),
+        "model": CFGDenoiserWithGrad(model_wrap, cond_fns, clamp_func), #CFGDenoiser(model_wrap),
         "x": x,
         "sigmas": sigmas,
         "extra_args": {"cond": c, "uncond": uc, "cond_scale": args.scale},
