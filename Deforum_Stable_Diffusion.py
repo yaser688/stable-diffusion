@@ -314,37 +314,87 @@ def make_mse_loss(target):
 
 
 ###
+# Thresholding functions for grad
+###
+def threshold_by(threshold, threshold_type):
+
+  def dynamic_thresholding(vals, sigma):
+      # Dynamic thresholding from Imagen paper (May 2022)
+      s = np.percentile(np.abs(vals.cpu()), threshold, axis=tuple(range(1,vals.ndim)))
+      s = np.max(np.append(s,1.0))
+      vals = torch.clamp(vals, -1*s, s)
+      vals = torch.FloatTensor.div(vals, s)
+      return vals
+
+  def static_thresholding(vals, sigma):
+      vals = torch.clamp(vals, -1*threshold, threshold)
+      return vals
+
+  def rms_thresholding(vals, sigma): # Thresholding that appears in Jax and Disco
+      magnitude = vals.square().mean(axis=(1,2,3),keepdims=True).sqrt()
+      vals = vals * torch.where(magnitude > threshold, threshold / magnitude, 1.0)
+      # vals = static_thresholding(vals, sigma)
+      return vals
+
+  if threshold_type == 'dynamic':
+      return dynamic_thresholding
+  elif threshold_type == 'static':
+      return static_thresholding
+  elif threshold_type == 'rms':
+      return rms_thresholding
+  else:
+      raise Exception(f"Thresholding type {threshold_type} not supported")
+
+
+###
 # Conditioning helper functions
 ###
 
-def make_cond_fn(loss_fn, scale, verbose=False):
+def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
     # Turns a loss function into a cond function that is applied to the decoded RGB sample
     # loss_fn (function): func(x, sigma, denoised) -> number
     # scale (number): how much this loss is applied to the image
+    # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
+    if wrt is None:
+        wrt = 'x'
+
     def cond_fn(x, sigma, denoised, **kwargs):
         with torch.enable_grad():
             denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
             grad = -torch.autograd.grad(loss, x)[0]
+        verbose_print('Loss:', loss.item())
+        return grad
 
+    def cond_fn_pred(x, sigma, denoised, **kwargs):
+        with torch.enable_grad():
+            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
+            grad = -torch.autograd.grad(loss, denoised)[0]
         verbose_print('Loss:', loss.item())
         return grad
 
     verbose_print = print if verbose else lambda *args, **kwargs: None
     
+    if wrt == 'x':
     return cond_fn
+    elif wrt == 'x0_pred':
+        return cond_fn_pred
+    else:
+        raise Exception(f"Variable wrt == {wrt} not recognised.")
 
-def apply_grads(x, sigma, denoised, cond_fns, clamp_func=None, add_grad_to=None, **kwargs):
+
+def apply_grads(x, sigma, denoised, cond_fns, clamp_func=None, gradient_wrt=None, **kwargs):
     # Applies gradient conditions
     # x: noisy latent
     # sigma: noise schedule sigma
     # denoised: x0_pred denoised latent
     # cond_fns: list of cond functions, each created with make_cond_fn
     # clamp_func: function(x, sigma) clips values of the grad function, can use sigma to clamp based on noise schedule
-    # add_grad_to: string in ["x", "x0_pred", "both"]; Add the gradient function to noisy x, denoised predicted x0, or both
+    # gradient_wrt: string in ["x", "x0_pred"]; Compute the gradient function with respect to x, or denoised x0
     total_cond_grad = torch.zeros_like(x)
     with torch.no_grad():
-        denoised_diff = x - denoised
+        denoised_diff = x - denoised # we are cheating. Ideally the gradient is calculated through the network and not skipped like this
     for cond_fn in cond_fns:
         if cond_fn is None: continue
         with torch.enable_grad():
@@ -353,19 +403,12 @@ def apply_grads(x, sigma, denoised, cond_fns, clamp_func=None, add_grad_to=None,
             cond_grad = cond_fn(x, sigma, denoised=pred_x0, **kwargs).detach()
             cond_grad = torch.nan_to_num(cond_grad, nan=0.0, posinf=float('inf'), neginf=-float('inf'))
         total_cond_grad += cond_grad
-    # total_cond_grad = clamp_func(total_cond_grad)
-    # guided_x0_pred = denoised.detach() + total_cond_grad * k_utils.append_dims(sigma**2, x.ndim)
-    print('max grad',torch.max(total_cond_grad).item())
-    print('min grad',torch.min(total_cond_grad).item())
     if clamp_func is not None:
         # total_cond_grad = clamp_func(total_cond_grad * k_utils.append_dims(sigma**2, x.ndim), sigma)
-        total_cond_grad = clamp_func(total_cond_grad, sigma) * k_utils.append_dims(sigma**2, x.ndim)
-        # total_cond_grad = clamp_func(total_cond_grad, sigma)
-    print('max grad after clamp',torch.max(total_cond_grad).item())
-    print('min grad after clamp',torch.min(total_cond_grad).item())
-    if add_grad_to == 'x0_pred' or add_grad_to == None or add_grad_to == 'both':
+        total_cond_grad = clamp_func(total_cond_grad, sigma) * k_utils.append_dims(sigma, x.ndim)
+    if gradient_wrt == 'x0_pred':
         denoised = denoised.detach() + total_cond_grad
-    if add_grad_to == 'x' or add_grad_to == None or add_grad_to == 'both':
+    elif gradient_wrt == 'x':
         x = x.detach() + total_cond_grad
     return x, denoised
 
@@ -374,7 +417,7 @@ class SamplerCallback(object):
     def __init__(self, args, mask=None, init_latent=None, sigmas=None, sampler=None,
                   cond_fns=None,
                   clamp_func=None,
-                  add_grad_to=None,
+                  gradient_wrt=None,
                   verbose=False):
         self.sampler_name = args.sampler
         self.dynamic_threshold = args.dynamic_threshold
@@ -385,7 +428,7 @@ class SamplerCallback(object):
         self.sampler = sampler
         self.cond_fns = cond_fns
         self.clamp_func = clamp_func
-        self.add_grad_to = add_grad_to
+        self.gradient_wrt = gradient_wrt
         self.verbose = verbose
 
         self.batch_size = args.n_samples
@@ -468,15 +511,15 @@ class SamplerCallback(object):
             args_dict['x'].copy_(new_img)
         if self.cond_fns is not None:
             sigma = args_dict['sigma']
-            new_img, guided_x0_pred = apply_grads(args_dict['x'], sigma, args_dict['denoised'], self.cond_fns, clamp_func=self.clamp_func, add_grad_to=self.add_grad_to)
+            new_img, guided_x0_pred = apply_grads(args_dict['x'], sigma, args_dict['denoised'], self.cond_fns, clamp_func=self.clamp_func, gradient_wrt=self.gradient_wrt)
 
             # display and save 
             self.verbose_print('sigma', sigma.item())
             self.verbose_print("Max pixel change due to grad",torch.max(new_img-args_dict['x']).item())
-            self.view_sample_step(args_dict['denoised'], "x0_pred_orig")
-            self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample_orig")
+            # self.view_sample_step(args_dict['denoised'], "x0_pred_orig")
+            # self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample_orig")
             if self.verbose:
-                if self.add_grad_to == 'x0_pred' or self.add_grad_to == 'both' or self.add_grad_to == 'None':
+                if self.gradient_wrt == 'x0_pred':
                     guided_diff = guided_x0_pred - args_dict['denoised']
                 else:
                     guided_diff = new_img - args_dict['x']
@@ -679,44 +722,11 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
 
 
     cond_fns = [
-        make_cond_fn(clip_cond_fn, args.clip_loss_scale, verbose=True) if args.clip_loss_scale != 0 else None,
+        make_cond_fn(clip_cond_fn, args.clip_loss_scale, wrt=args.gradient_wrt, verbose=False) if args.clip_loss_scale != 0 else None,
         make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale != 0 else None,
         make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, verbose=True) if args.init_mse_scale != 0 else None,
         ]
 
-    ###
-    # Thresholding functions for grad
-    ###
-    def threshold_by(threshold, threshold_type):
-
-      def dynamic_thresholding(vals, sigma):
-          # Dynamic thresholding from Imagen paper (May 2022)
-          s = np.percentile(np.abs(vals.cpu()), threshold, axis=tuple(range(1,vals.ndim)))
-          print('s',s)
-          s = np.max(np.append(s,1.0))
-          print('s',s)
-          print('max pixel', np.max(np.percentile(np.abs(vals.cpu()), 1.0, axis=tuple(range(1,vals.ndim)))))
-          vals = torch.clamp(vals, -1*s, s)
-          vals = torch.FloatTensor.div(vals, s)
-          return vals
-
-      def static_thresholding(vals, sigma):
-          vals = torch.clamp(vals, -1*threshold, threshold)
-          return vals
-
-      def rms_thresholding(vals, sigma): # Thresholding that appears in Jax and Disco
-          magnitude = vals.square().mean(axis=(1,2,3),keepdims=True).sqrt()
-          vals = vals * torch.where(magnitude > threshold, threshold / magnitude, 1.0)
-          return vals
-
-      if threshold_type == 'dynamic':
-          return dynamic_thresholding
-      elif threshold_type == 'static':
-          return static_thresholding
-      elif threshold_type == 'rms':
-          return rms_thresholding
-      else:
-          raise Exception(f"Thresholding type {threshold_type} not supported")
 
     clamp_func = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
 
@@ -727,7 +737,7 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             sampler=sampler,
                             cond_fns=None,
                             clamp_func=None,
-                            add_grad_to=None,
+                            gradient_wrt=None,
                             verbose=True).callback   
 
     results = []
@@ -756,6 +766,9 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             cond_fns=cond_fns,
                             clamp_func=clamp_func,
                             device=device, 
+                            gradient_wrt=args.gradient_wrt,
+                            gradient_add_to=args.gradient_add_to,
+                            cond_uncond_sync=args.cond_uncond_sync,
                             cb=callback)
                     else:
                         # args.sampler == 'plms' or args.sampler == 'ddim':
@@ -818,7 +831,7 @@ custom_checkpoint_path = "" #@param {type:"string"}
 
 load_on_run_all = True #@param {type: 'boolean'}
 half_precision = True # check
-check_sha256 = True #@param {type:"boolean"}
+check_sha256 = False #@param {type:"boolean"}
 
 model_map = {
     "sd-v1-4-full-ema.ckpt": {'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a'},
@@ -1653,8 +1666,8 @@ else:
             newest_dir = max(all_step_dirs, key=os.path.getmtime)
             image_path = os.path.join(newest_dir, fname)
             print(image_path)
-            mp4_path = os.path.join(newest_dir, f"{args.timestring}.mp4")
-            max_frames = str(anim_args.max_frames)
+            mp4_path = os.path.join(newest_dir, f"{args.timestring}_{args.}_{path_name_modifier}.mp4")
+            max_frames = str(args.steps)
         else: # render images for a video
             image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
             mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
