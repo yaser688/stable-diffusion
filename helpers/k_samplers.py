@@ -4,10 +4,10 @@ from k_diffusion.external import CompVisDenoiser
 from k_diffusion import sampling
 from k_diffusion import utils as k_utils
 from torch import nn
-# 
+# Display functions
 from torchvision.utils import make_grid
 from IPython import display
-import torchvision.transforms.functional as TF
+from torchvision.transforms.functional import to_pil_image
 
 class CFGDenoiser(nn.Module):
     def __init__(self, model):
@@ -73,7 +73,7 @@ class CFGDenoiserWithGrad(nn.Module):
         images = images.double().cpu().add(1).div(2).clamp(0, 1)
         images = torch.tensor(images.numpy())
         grid = make_grid(images, 4).cpu()
-        display.display(TF.to_pil_image(grid))
+        display.display(to_pil_image(grid))
         return
 
     def forward(self, x, sigma, uncond, cond, cond_scale):        
@@ -125,6 +125,7 @@ def sampler_fn(
     if not torch.cuda.is_available()
     else torch.device("cuda"),
     cb: Callable[[Any], None] = None,
+    verbose: Optional[bool] = False,
 ) -> torch.Tensor:
     shape = [args.C, args.H // args.f, args.W // args.f]
     sigmas: torch.Tensor = model_wrap.get_sigmas(args.steps)
@@ -143,7 +144,13 @@ def sampler_fn(
         else:
             x = torch.zeros([args.n_samples, *shape], device=device)
     sampler_args = {
-        "model": CFGDenoiserWithGrad(model_wrap, cond_fns, clamp_func, gradient_wrt, gradient_add_to, cond_uncond_sync), #CFGDenoiser(model_wrap),
+        "model": CFGDenoiserWithGrad(model_wrap, 
+                                    cond_fns, 
+                                    clamp_func, 
+                                    gradient_wrt, 
+                                    gradient_add_to, 
+                                    cond_uncond_sync,
+                                    verbose=verbose),
         "x": x,
         "sigmas": sigmas,
         "extra_args": {"cond": c, "uncond": uc, "cond_scale": args.scale},

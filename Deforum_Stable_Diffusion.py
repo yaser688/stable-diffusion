@@ -330,7 +330,7 @@ def threshold_by(threshold, threshold_type):
       vals = torch.clamp(vals, -1*threshold, threshold)
       return vals
 
-  def rms_thresholding(vals, sigma): # Thresholding that appears in Jax and Disco
+  def mean_thresholding(vals, sigma): # Thresholding that appears in Jax and Disco
       magnitude = vals.square().mean(axis=(1,2,3),keepdims=True).sqrt()
       vals = vals * torch.where(magnitude > threshold, threshold / magnitude, 1.0)
       # vals = static_thresholding(vals, sigma)
@@ -340,8 +340,8 @@ def threshold_by(threshold, threshold_type):
       return dynamic_thresholding
   elif threshold_type == 'static':
       return static_thresholding
-  elif threshold_type == 'rms':
-      return rms_thresholding
+  elif threshold_type == 'mean':
+      return mean_thresholding
   else:
       raise Exception(f"Thresholding type {threshold_type} not supported")
 
@@ -377,47 +377,18 @@ def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
     verbose_print = print if verbose else lambda *args, **kwargs: None
     
     if wrt == 'x':
-    return cond_fn
+        return cond_fn
     elif wrt == 'x0_pred':
         return cond_fn_pred
     else:
         raise Exception(f"Variable wrt == {wrt} not recognised.")
 
-
-def apply_grads(x, sigma, denoised, cond_fns, clamp_func=None, gradient_wrt=None, **kwargs):
-    # Applies gradient conditions
-    # x: noisy latent
-    # sigma: noise schedule sigma
-    # denoised: x0_pred denoised latent
-    # cond_fns: list of cond functions, each created with make_cond_fn
-    # clamp_func: function(x, sigma) clips values of the grad function, can use sigma to clamp based on noise schedule
-    # gradient_wrt: string in ["x", "x0_pred"]; Compute the gradient function with respect to x, or denoised x0
-    total_cond_grad = torch.zeros_like(x)
-    with torch.no_grad():
-        denoised_diff = x - denoised # we are cheating. Ideally the gradient is calculated through the network and not skipped like this
-    for cond_fn in cond_fns:
-        if cond_fn is None: continue
-        with torch.enable_grad():
-            x = x.detach().requires_grad_()
-            pred_x0 = x + denoised_diff
-            cond_grad = cond_fn(x, sigma, denoised=pred_x0, **kwargs).detach()
-            cond_grad = torch.nan_to_num(cond_grad, nan=0.0, posinf=float('inf'), neginf=-float('inf'))
-        total_cond_grad += cond_grad
-    if clamp_func is not None:
-        # total_cond_grad = clamp_func(total_cond_grad * k_utils.append_dims(sigma**2, x.ndim), sigma)
-        total_cond_grad = clamp_func(total_cond_grad, sigma) * k_utils.append_dims(sigma, x.ndim)
-    if gradient_wrt == 'x0_pred':
-        denoised = denoised.detach() + total_cond_grad
-    elif gradient_wrt == 'x':
-        x = x.detach() + total_cond_grad
-    return x, denoised
-
+#
+# Callback functions
+#
 class SamplerCallback(object):
     # Creates the callback function to be passed into the samplers for each step
     def __init__(self, args, mask=None, init_latent=None, sigmas=None, sampler=None,
-                  cond_fns=None,
-                  clamp_func=None,
-                  gradient_wrt=None,
                   verbose=False):
         self.sampler_name = args.sampler
         self.dynamic_threshold = args.dynamic_threshold
@@ -426,9 +397,6 @@ class SamplerCallback(object):
         self.init_latent = init_latent 
         self.sigmas = sigmas
         self.sampler = sampler
-        self.cond_fns = cond_fns
-        self.clamp_func = clamp_func
-        self.gradient_wrt = gradient_wrt
         self.verbose = verbose
 
         self.batch_size = args.n_samples
@@ -469,9 +437,6 @@ class SamplerCallback(object):
         if self.save_sample_per_step:
             fname = f'{self.step_index:03}_{path_name_modifier}.png'
             for i, sample in enumerate(samples):
-                # sample = 255. * rearrange(sample.cpu().numpy(), 'c h w -> h w c')
-                # image = Image.fromarray(sample.astype(np.uint8))
-                # image.save(os.path.join(self.paths_to_image_steps[i], fname))
                 sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
                 sample = torch.tensor(np.array(sample))
                 grid = make_grid(sample, 4).cpu()
@@ -509,30 +474,10 @@ class SamplerCallback(object):
             is_masked = torch.logical_and(self.mask >= self.mask_schedule[args_dict['i']], self.mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + args_dict['x'] * torch.where(is_masked,0,1)
             args_dict['x'].copy_(new_img)
-        if self.cond_fns is not None:
-            sigma = args_dict['sigma']
-            new_img, guided_x0_pred = apply_grads(args_dict['x'], sigma, args_dict['denoised'], self.cond_fns, clamp_func=self.clamp_func, gradient_wrt=self.gradient_wrt)
-
-            # display and save 
-            self.verbose_print('sigma', sigma.item())
-            self.verbose_print("Max pixel change due to grad",torch.max(new_img-args_dict['x']).item())
-            # self.view_sample_step(args_dict['denoised'], "x0_pred_orig")
-            # self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample_orig")
-            if self.verbose:
-                if self.gradient_wrt == 'x0_pred':
-                    guided_diff = guided_x0_pred - args_dict['denoised']
-                else:
-                    guided_diff = new_img - args_dict['x']
-
-            args_dict['x'].copy_(new_img)
-            args_dict['denoised'].copy_(guided_x0_pred)
 
         if self.verbose:
             self.view_sample_step(args_dict['denoised'], "x0_pred")
             self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
-            if self.cond_fns is not None:
-                # self.view_sample_step(x0_pred_guided_diff, "x0_pred_guided_diff")
-                self.view_sample_step(torch.abs(model.decode_first_stage(guided_diff)*2.0) - 1.0, "guided_diff")
 
     # Callback for Compvis samplers
     # Function that is called on the image (img) and step (i) at each step
@@ -550,20 +495,9 @@ class SamplerCallback(object):
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
 
-        if self.cond_fns is not None:
-            #TODO decide on a sigma schedule for 
-            # i_inv = len(sigmas) - i - 1
-            # sigma = sampler.ddim_sigmas[i_inv] # this sigma varies with eta (all zeros when ddim_eta==0)
-            # sigma = sampler.ddim_sqrt_one_minus_alphas[i_inv]
-            sigma = self.sigmas[i]
-            self.verbose_print('sigma', sigma.item())
-            new_img, guided_x0_pred = apply_grads(img, sigma, pred_x0, self.cond_fns)
-            self.verbose_print("Max pixel change due to grad",torch.max(new_img-img).item())
-            img.copy_(new_img)
-            # pred_x0.copy_(guided_x0_pred) # compvis loops overwrite new pred_x0 on next step, so not needed
-
-        self.view_sample_step(img, "x0_pred")
-        self.view_sample_step(model.decode_first_stage(img), "x0_pred_sample")
+        if self.verbose:
+            self.view_sample_step(img, "x0_pred")
+            self.view_sample_step(model.decode_first_stage(img), "x0_pred_sample")
 
 
 def sample_from_cv2(sample: np.ndarray) -> torch.Tensor:
@@ -735,9 +669,6 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            cond_fns=None,
-                            clamp_func=None,
-                            gradient_wrt=None,
                             verbose=True).callback   
 
     results = []
@@ -769,7 +700,8 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             gradient_wrt=args.gradient_wrt,
                             gradient_add_to=args.gradient_add_to,
                             cond_uncond_sync=args.cond_uncond_sync,
-                            cb=callback)
+                            cb=callback,
+                            verbose=False)
                     else:
                         # args.sampler == 'plms' or args.sampler == 'ddim':
                         #TODO Implement conditioning for ddim and plms samplers
@@ -831,7 +763,7 @@ custom_checkpoint_path = "" #@param {type:"string"}
 
 load_on_run_all = True #@param {type: 'boolean'}
 half_precision = True # check
-check_sha256 = False #@param {type:"boolean"}
+check_sha256 = True #@param {type:"boolean"}
 
 model_map = {
     "sd-v1-4-full-ema.ckpt": {'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a'},
@@ -1076,7 +1008,7 @@ from torch.nn import functional as F
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print('Using device:', device)
 
-clip_name = 'ViT-B/16' #'ViT-L/14' # 'ViT-L/14@336px' #
+clip_name = 'ViT-L/14@336px' #'ViT-B/16' #'ViT-L/14' # 
 clip_model = clip.load(clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
 clip_size = clip_model.visual.input_resolution
 normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
@@ -1128,8 +1060,8 @@ weights /= weights.sum().abs()
 def DeforumArgs():
 
     #@markdown **Image Settings**
-    W = 448 #@param
-    H = 448 #@param
+    W = 512 #@param
+    H = 512 #@param
     W, H = map(lambda x: x - x % 64, (W, H))  # resize to integer multiple of 64
 
     #@markdown **Sampling Settings**
@@ -1175,10 +1107,14 @@ def DeforumArgs():
     #@markdown **Conditioning Settings**
     blue_loss_scale = 0 #@param {type:"number"}
     init_mse_scale = 0 #@param {type:"number"}
-    clip_loss_scale = 100 #@param {type:"number"}
+    clip_loss_scale = 1000 #@param {type:"number"}
     clamp_grad_threshold = 0.01 #@param {type:"number"}
-    grad_threshold_type = 'rms' #@param ["dynamic", "static", "rms"]
-    add_grad_to = 'x0_pred' #@p#aram ["x", "x0_pred", "both"]
+    grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
+    gradient_wrt = 'x' #@param ["x", "x0_pred"]
+    gradient_add_to = 'cond' #@param ["cond", "uncond", "both"]
+
+    #@markdown **Speed vs VRAM Settings**
+    cond_uncond_sync = False #@param {type:"boolean"}
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
