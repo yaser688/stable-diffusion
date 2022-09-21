@@ -3,7 +3,7 @@
 # !!   "id": "c442uQJ_gUgy"
 # !! }}
 """
-# **Deforum Stable Diffusion v0.3**
+# **Deforum Stable Diffusion v0.4**
 [Stable Diffusion](https://github.com/CompVis/stable-diffusion) by Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, Björn Ommer and the [Stability.ai](https://stability.ai/) Team. [K Diffusion](https://github.com/crowsonkb/k-diffusion) by [Katherine Crowson](https://twitter.com/RiversHaveWings). You need to get the ckpt file and put it on your Google Drive first to use this. It can be downloaded from [HuggingFace](https://huggingface.co/CompVis/stable-diffusion).
 
 Notebook by [deforum](https://discord.gg/upmXXsrwZc)
@@ -80,7 +80,7 @@ if setup_environment:
     all_process = [
         ['pip', 'install', 'torch==1.12.1+cu113', 'torchvision==0.13.1+cu113', '--extra-index-url', 'https://download.pytorch.org/whl/cu113'],
         ['pip', 'install', 'omegaconf==2.2.3', 'einops==0.4.1', 'pytorch-lightning==1.7.4', 'torchmetrics==0.9.3', 'torchtext==0.13.1', 'transformers==4.21.2', 'kornia==0.6.7'],
-        ['git', 'clone', '-b', 'conditioning', 'https://github.com/deforum/stable-diffusion'],
+        ['git', 'clone', '-b', 'conditioning', 'https://github.com/enzymezoo-code/stable-diffusion'],
         ['pip', 'install', '-e', 'git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers'],
         ['pip', 'install', '-e', 'git+https://github.com/openai/CLIP.git@main#egg=clip'],
         ['pip', 'install', 'accelerate', 'ftfy', 'jsonmerge', 'matplotlib', 'resize-right', 'timm', 'torchdiffeq'],
@@ -102,26 +102,32 @@ if setup_environment:
 
 # %%
 # !! {"metadata":{
+# !!   "id": "LJq1juNP92xy"
+# !! }}
+pip_sub_p_res = subprocess.run(['pip', 'install', 'git+https://github.com/openai/CLI'], stdout=subprocess.PIPE).stdout.decode('utf-8') #<cc-cm>
+print(pip_sub_p_res) #<cc-cm>
+
+
+# %%
+# !! {"metadata":{
 # !!   "id": "81qmVZbrm4uu",
 # !!   "cellView": "form"
 # !! }}
 #@markdown **Python Definitions**
 import json
 from IPython import display
-
-import math, os, pathlib, shutil, subprocess, sys, time
+import gc, math, os, pathlib, subprocess, sys, time
 import cv2
 import numpy as np
 import pandas as pd
 import random
 import requests
-import torch, torchvision
+import torch
 import torch.nn as nn
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from contextlib import contextmanager, nullcontext
 from einops import rearrange, repeat
-from itertools import islice
 from omegaconf import OmegaConf
 from PIL import Image
 from pytorch_lightning import seed_everything
@@ -143,21 +149,16 @@ sys.path.extend([
 
 import py3d_tools as p3d
 
-from helpers import save_samples, sampler_fn
-from infer import InferenceHelper
-from k_diffusion import sampling
-from k_diffusion import utils as k_utils
+from helpers import DepthModel, sampler_fn
 from k_diffusion.external import CompVisDenoiser
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-from midas.dpt_depth import DPTDepthModel
-from midas.transforms import Resize, NormalizeImage, PrepareForNet
 
 def sanitize(prompt):
     whitelist = set('abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ')
     tmp = ''.join(filter(whitelist.__contains__, prompt))
-    return '_'.join(prompt.split(" "))
+    return tmp.replace(' ', '_')
 
 def anim_frame_warp_2d(prev_img_cv2, args, anim_args, keys, frame_idx):
     angle = keys.angle_series[frame_idx]
@@ -196,19 +197,8 @@ def anim_frame_warp_3d(prev_img_cv2, depth, anim_args, keys, frame_idx):
     torch.cuda.empty_cache()
     return result
 
-def add_noise(sample: torch.Tensor, noise_amt: float):
+def add_noise(sample: torch.Tensor, noise_amt: float) -> torch.Tensor:
     return sample + torch.randn(sample.shape, device=sample.device) * noise_amt
-
-def download_depth_models():
-    def wget(url, outputdir):
-        print(subprocess.run(['wget', url, '-P', outputdir], stdout=subprocess.PIPE).stdout.decode('utf-8'))
-    if not os.path.exists(os.path.join(models_path, 'dpt_large-midas-2f21e586.pt')):
-        print("Downloading dpt_large-midas-2f21e586.pt...")
-        wget("https://github.com/intel-isl/DPT/releases/download/1_0/dpt_large-midas-2f21e586.pt", models_path)
-    if not os.path.exists('pretrained/AdaBins_nyu.pt'):
-        print("Downloading AdaBins_nyu.pt...")
-        os.makedirs('pretrained', exist_ok=True)
-        wget("https://cloudflare-ipfs.com/ipfs/Qmd2mMnDLWePKmgfS8m6ntAg4nhV5VkUyAydYBp8cWWeB7/AdaBins_nyu.pt", 'pretrained')
 
 def get_output_folder(output_path, batch_folder):
     out_path = os.path.join(output_path,time.strftime('%Y-%m'))
@@ -217,58 +207,79 @@ def get_output_folder(output_path, batch_folder):
     os.makedirs(out_path, exist_ok=True)
     return out_path
 
-def load_depth_model(optimize=True):
-    midas_model = DPTDepthModel(
-        path=f"{models_path}/dpt_large-midas-2f21e586.pt",
-        backbone="vitl16_384",
-        non_negative=True,
-    )
-    normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-
-    midas_transform = T.Compose([
-        Resize(
-            384, 384,
-            resize_target=None,
-            keep_aspect_ratio=True,
-            ensure_multiple_of=32,
-            resize_method="minimal",
-            image_interpolation_method=cv2.INTER_CUBIC,
-        ),
-        normalization,
-        PrepareForNet()
-    ])
-
-    midas_model.eval()    
-    if optimize:
-        if device == torch.device("cuda"):
-            midas_model = midas_model.to(memory_format=torch.channels_last)
-            midas_model = midas_model.half()
-    midas_model.to(device)
-
-    return midas_model, midas_transform
-
-def load_img(path, shape):
+def load_img(path, shape, use_alpha_as_mask=False):
+    # use_alpha_as_mask: Read the alpha channel of the image as the mask image
     if path.startswith('http://') or path.startswith('https://'):
-        image = Image.open(requests.get(path, stream=True).raw).convert('RGB')
+        image = Image.open(requests.get(path, stream=True).raw)
     else:
-        image = Image.open(path).convert('RGB')
+        image = Image.open(path)
+
+    if use_alpha_as_mask:
+        image = image.convert('RGBA')
+    else:
+        image = image.convert('RGB')
 
     image = image.resize(shape, resample=Image.LANCZOS)
+
+    mask_image = None
+    if use_alpha_as_mask:
+      # Split alpha channel into a mask_image
+      red, green, blue, alpha = Image.Image.split(image)
+      mask_image = alpha.convert('L')
+      image = image.convert('RGB')
+
     image = np.array(image).astype(np.float16) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
-    return 2.*image - 1.
+    image = 2.*image - 1.
 
-def load_mask_img(path, shape):
-    # path (str): Path to the mask image
+    return image, mask_image
+
+def load_mask_latent(mask_input, shape):
+    # mask_input (str or PIL Image.Image): Path to the mask image or a PIL Image object
     # shape (list-like len(4)): shape of the image to match, usually latent_image.shape
-    mask_w_h = (shape[-1], shape[-2])
-    if path.startswith('http://') or path.startswith('https://'):
-        mask_image = Image.open(requests.get(path, stream=True).raw).convert('RGBA')
+    
+    if isinstance(mask_input, str): # mask input is probably a file name
+        if mask_input.startswith('http://') or mask_input.startswith('https://'):
+            mask_image = Image.open(requests.get(mask_input, stream=True).raw).convert('RGBA')
+        else:
+            mask_image = Image.open(mask_input).convert('RGBA')
+    elif isinstance(mask_input, Image.Image):
+        mask_image = mask_input
     else:
-        mask_image = Image.open(path).convert('RGBA')
+        raise Exception("mask_input must be a PIL image or a file name")
+
+    mask_w_h = (shape[-1], shape[-2])
     mask = mask_image.resize(mask_w_h, resample=Image.LANCZOS)
     mask = mask.convert("L")
+    return mask
+
+def prepare_mask(mask_input, mask_shape, mask_brightness_adjust=1.0, mask_contrast_adjust=1.0):
+    # mask_input (str or PIL Image.Image): Path to the mask image or a PIL Image object
+    # shape (list-like len(4)): shape of the image to match, usually latent_image.shape
+    # mask_brightness_adjust (non-negative float): amount to adjust brightness of the iamge, 
+    #     0 is black, 1 is no adjustment, >1 is brighter
+    # mask_contrast_adjust (non-negative float): amount to adjust contrast of the image, 
+    #     0 is a flat grey image, 1 is no adjustment, >1 is more contrast
+    
+    mask = load_mask_latent(mask_input, mask_shape)
+
+    # Mask brightness/contrast adjustments
+    if mask_brightness_adjust != 1:
+        mask = TF.adjust_brightness(mask, mask_brightness_adjust)
+    if mask_contrast_adjust != 1:
+        mask = TF.adjust_contrast(mask, mask_contrast_adjust)
+
+    # Mask image to array
+    mask = np.array(mask).astype(np.float32) / 255.0
+    mask = np.tile(mask,(4,1,1))
+    mask = np.expand_dims(mask,axis=0)
+    mask = torch.from_numpy(mask)
+
+    if args.invert_mask:
+        mask = ( (mask - 0.5) * -1) + 0.5
+    
+    mask = np.clip(mask,0,1)
     return mask
 
 def maintain_colors(prev_img, color_match_sample, mode):
@@ -301,62 +312,147 @@ def make_mse_loss(target):
         return (x - target).square().mean()
     return mse_loss
 
+
+###
+# Thresholding functions for grad
+###
+def threshold_by(threshold, threshold_type):
+
+  def dynamic_thresholding(vals, sigma):
+      # Dynamic thresholding from Imagen paper (May 2022)
+      s = np.percentile(np.abs(vals.cpu()), threshold, axis=tuple(range(1,vals.ndim)))
+      s = np.max(np.append(s,1.0))
+      vals = torch.clamp(vals, -1*s, s)
+      vals = torch.FloatTensor.div(vals, s)
+      return vals
+
+  def static_thresholding(vals, sigma):
+      vals = torch.clamp(vals, -1*threshold, threshold)
+      return vals
+
+  def mean_thresholding(vals, sigma): # Thresholding that appears in Jax and Disco
+      magnitude = vals.square().mean(axis=(1,2,3),keepdims=True).sqrt()
+      vals = vals * torch.where(magnitude > threshold, threshold / magnitude, 1.0)
+      # vals = static_thresholding(vals, sigma)
+      return vals
+
+  if threshold_type == 'dynamic':
+      return dynamic_thresholding
+  elif threshold_type == 'static':
+      return static_thresholding
+  elif threshold_type == 'mean':
+      return mean_thresholding
+  else:
+      raise Exception(f"Thresholding type {threshold_type} not supported")
+
+
 ###
 # Conditioning helper functions
 ###
 
-def make_cond_fn(loss_fn, scale, verbose=False):
+def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
     # Turns a loss function into a cond function that is applied to the decoded RGB sample
     # loss_fn (function): func(x, sigma, denoised) -> number
     # scale (number): how much this loss is applied to the image
+    # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
+    if wrt is None:
+        wrt = 'x'
+
     def cond_fn(x, sigma, denoised, **kwargs):
         with torch.enable_grad():
             denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
             grad = -torch.autograd.grad(loss, x)[0]
-            verbose_print()
-            verbose_print('Loss:', loss.item())
-            verbose_print("Max cond_grad", torch.max(grad))
-            verbose_print("Min cond_grad", torch.min(grad))
+        verbose_print('Loss:', loss.item())
+        return grad
+
+    def cond_fn_pred(x, sigma, denoised, **kwargs):
+        with torch.enable_grad():
+            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
+            grad = -torch.autograd.grad(loss, denoised)[0]
+        verbose_print('Loss:', loss.item())
         return grad
 
     verbose_print = print if verbose else lambda *args, **kwargs: None
     
-    return cond_fn
+    if wrt == 'x':
+        return cond_fn
+    elif wrt == 'x0_pred':
+        return cond_fn_pred
+    else:
+        raise Exception(f"Variable wrt == {wrt} not recognised.")
 
+#
+# Callback functions
+#
+class SamplerCallback(object):
+    # Creates the callback function to be passed into the samplers for each step
+    def __init__(self, args, mask=None, init_latent=None, sigmas=None, sampler=None,
+                  verbose=False):
+        self.sampler_name = args.sampler
+        self.dynamic_threshold = args.dynamic_threshold
+        self.static_threshold = args.static_threshold
+        self.mask = mask
+        self.init_latent = init_latent 
+        self.sigmas = sigmas
+        self.sampler = sampler
+        self.verbose = verbose
 
-def apply_grads(x, sigma, denoised, cond_fns, **kwargs):
-    # Applies gradient conditions
-    # x: noisy latent
-    # sigma: noise schedule sigma
-    # denoised: x0_pred denoised latent
-    # cond_fns: list of cond functions, each created with make_cond_fn
-    total_cond_grad = torch.zeros_like(x)
-    with torch.no_grad():
-        denoised_diff = x - denoised
-    for cond_fn in cond_fns:
-        if cond_fn is None: continue
-        with torch.enable_grad():
-            x = x.detach().requires_grad_()
-            pred_x0 = x + denoised_diff
-            cond_grad = cond_fn(x, sigma, denoised=pred_x0, **kwargs).detach()
-        total_cond_grad += cond_grad
-    guided_x0_pred = denoised.detach() + total_cond_grad * k_utils.append_dims(sigma**2, x.ndim)
-    guided_x = x.detach() + total_cond_grad * k_utils.append_dims(sigma**2, x.ndim)
-    return guided_x, guided_x0_pred
+        self.batch_size = args.n_samples
+        self.save_sample_per_step = args.save_sample_per_step
+        self.show_sample_per_step = args.show_sample_per_step
+        self.paths_to_image_steps = [os.path.join( args.outdir, f"{args.timestring}_{index:02}_{args.seed}") for index in range(args.n_samples) ]
 
+        if self.save_sample_per_step:
+            for path in self.paths_to_image_steps:
+                os.makedirs(path, exist_ok=True)
 
-def make_callback(sampler_name, 
-                  dynamic_threshold=None, 
-                  static_threshold=None, 
-                  mask=None, 
-                  init_latent=None, 
-                  sigmas=None, 
-                  sampler=None, 
-                  masked_noise_modifier=1.0,
-                  cond_fns=None,
-                  verbose=False):  
-    # Creates the callback function to be passed into the samplers
+        self.step_index = 0
+
+        self.noise = None
+        if init_latent is not None:
+            self.noise = torch.randn_like(init_latent, device=device)
+
+        self.mask_schedule = None
+        if sigmas is not None and len(sigmas) > 0:
+            self.mask_schedule, _ = torch.sort(sigmas/torch.max(sigmas))
+        elif len(sigmas) == 0:
+            self.mask = None # no mask needed if no steps (usually happens because strength==1.0)
+
+        if self.sampler_name in ["plms","ddim"]: 
+            if mask is not None:
+                assert sampler is not None, "Callback function for stable-diffusion samplers requires sampler variable"
+
+        if self.sampler_name in ["plms","ddim"]: 
+            # Callback function formated for compvis latent diffusion samplers
+            self.callback = self.img_callback_
+        else: 
+            # Default callback function uses k-diffusion sampler variables
+            self.callback = self.k_callback_
+
+        self.verbose_print = print if verbose else lambda *args, **kwargs: None
+
+    def view_sample_step(self, samples, path_name_modifier=''):
+        if self.save_sample_per_step:
+            fname = f'{self.step_index:03}_{path_name_modifier}.png'
+            for i, sample in enumerate(samples):
+                sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
+                sample = torch.tensor(np.array(sample))
+                grid = make_grid(sample, 4).cpu()
+                TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
+        if self.show_sample_per_step:
+            print(path_name_modifier)
+            self.display_images(samples)
+        return
+
+    def display_images(self, images):
+        images = images.double().cpu().add(1).div(2).clamp(0, 1)
+        images = torch.tensor(np.array(images))
+        grid = make_grid(images, 4).cpu()
+        display.display(TF.to_pil_image(grid))
+        return
+
     # The callback function is applied to the image at each step
     def dynamic_thresholding_(img, threshold):
         # Dynamic thresholding from Imagen paper (May 2022)
@@ -367,100 +463,42 @@ def make_callback(sampler_name,
 
     # Callback for samplers in the k-diffusion repo, called thus:
     #   callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
-    def k_callback_(args_dict):
-        if dynamic_threshold is not None:
-            dynamic_thresholding_(args_dict['x'], dynamic_threshold)
-        if static_threshold is not None:
-            torch.clamp_(args_dict['x'], -1*static_threshold, static_threshold)
-        if mask is not None:
-            init_noise = init_latent + noise * args_dict['sigma']
-            is_masked = torch.logical_and(mask >= mask_schedule[args_dict['i']], mask != 0 )
+    def k_callback_(self, args_dict):
+        self.step_index = args_dict['i']
+        if self.dynamic_threshold is not None:
+            self.dynamic_thresholding_(args_dict['x'], self.dynamic_threshold)
+        if self.static_threshold is not None:
+            torch.clamp_(args_dict['x'], -1*self.static_threshold, self.static_threshold)
+        if self.mask is not None:
+            init_noise = self.init_latent + self.noise * args_dict['sigma']
+            is_masked = torch.logical_and(self.mask >= self.mask_schedule[args_dict['i']], self.mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + args_dict['x'] * torch.where(is_masked,0,1)
             args_dict['x'].copy_(new_img)
-        if cond_fns is not None:
-            sigma = args_dict['sigma']
-            verbose_print('sigma', sigma)
-            new_img, guided_x0_pred = apply_grads(args_dict['x'], sigma, args_dict['denoised'], cond_fns)
-            verbose_print("Max pixel change of new image",torch.max(new_img-args_dict['x']))
-            args_dict['x'].copy_(new_img)
-            args_dict['denoised'].copy_(guided_x0_pred)
-        
 
-    # Function that is called on the image (img), denoised image (pred_x0), and step (i) at each step
-    def img_callback_(img, pred_x0, i):
+        if self.verbose:
+            self.view_sample_step(args_dict['denoised'], "x0_pred")
+            self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
+
+    # Callback for Compvis samplers
+    # Function that is called on the image (img) and step (i) at each step
+    def img_callback_(self, img, pred_x0, i):
+        self.step_index = i
         # Thresholding functions
-        if dynamic_threshold is not None:
-            dynamic_thresholding_(img, dynamic_threshold)
-        if static_threshold is not None:
-            torch.clamp_(img, -1*static_threshold, static_threshold)
-        if mask is not None:
-            i_inv = len(sigmas) - i - 1
-            init_noise = sampler.stochastic_encode(init_latent, torch.tensor([i_inv]*batch_size).to(device), noise=noise)
-            is_masked = torch.logical_and(mask >= mask_schedule[i], mask != 0 )
+        if self.dynamic_threshold is not None:
+            self.dynamic_thresholding_(img, self.dynamic_threshold)
+        if self.static_threshold is not None:
+            torch.clamp_(img, -1*self.static_threshold, self.static_threshold)
+        if self.mask is not None:
+            i_inv = len(self.sigmas) - i - 1
+            init_noise = self.sampler.stochastic_encode(self.init_latent, torch.tensor([i_inv]*self.batch_size).to(device), noise=self.noise)
+            is_masked = torch.logical_and(self.mask >= self.mask_schedule[i], self.mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
-        if cond_fns is not None:
-            #TODO decide on a sigma schedule for 
-            # i_inv = len(sigmas) - i - 1
-            # sigma = sampler.ddim_sigmas[i_inv] # this sigma varies with eta (all zeros when ddim_eta==0)
-            # sigma = sampler.ddim_sqrt_one_minus_alphas[i_inv]
-            sigma = sigmas[i]
-            verbose_print('sigma', sigma)
-            new_img, guided_x0_pred = apply_grads(img, sigma, pred_x0, cond_fns)
-            verbose_print("Max pixel change of new image",torch.max(new_img-img))
-            img.copy_(new_img)
-            # pred_x0.copy_(guided_x0_pred) # compvis loops overwrite new pred_x0 on next step, so not needed
-        
-            
-              
-    if init_latent is not None:
-        noise = torch.randn_like(init_latent, device=device) * masked_noise_modifier
-    if sigmas is not None and len(sigmas) > 0:
-        mask_schedule, _ = torch.sort(sigmas/torch.max(sigmas))
-    elif len(sigmas) == 0:
-        mask = None # no mask needed if no steps (usually happens because strength==1.0)
 
-    if sampler_name in ["plms","ddim"]: 
-        # Callback function formated for compvis latent diffusion samplers
-        if mask is not None:
-            assert sampler is not None, "Callback function for stable-diffusion samplers requires sampler variable"
-            batch_size = init_latent.shape[0]
-        callback = img_callback_
-    else: 
-        # Default callback function uses k-diffusion sampler variables
-        callback = k_callback_
-    
-    verbose_print = print if verbose else lambda *args, **kwargs: None
+        if self.verbose:
+            self.view_sample_step(img, "x0_pred")
+            self.view_sample_step(model.decode_first_stage(img), "x0_pred_sample")
 
-    return callback
-
-def prepare_mask(mask_file, mask_shape, mask_brightness_adjust=1.0, mask_contrast_adjust=1.0):
-    # path (str): Path to the mask image
-    # shape (list-like len(4)): shape of the image to match, usually latent_image.shape
-    # mask_brightness_adjust (non-negative float): amount to adjust brightness of the iamge, 
-    #     0 is black, 1 is no adjustment, >1 is brighter
-    # mask_contrast_adjust (non-negative float): amount to adjust contrast of the image, 
-    #     0 is a flat grey image, 1 is no adjustment, >1 is more contrast
-                            
-    mask = load_mask_img(mask_file, mask_shape)
-
-    # Mask brightness/contrast adjustments
-    if mask_brightness_adjust != 1:
-        mask = TF.adjust_brightness(mask, mask_brightness_adjust)
-    if mask_contrast_adjust != 1:
-        mask = TF.adjust_contrast(mask, mask_contrast_adjust)
-
-    # Mask image to array
-    mask = np.array(mask).astype(np.float32) / 255.0
-    mask = np.tile(mask,(4,1,1))
-    mask = np.expand_dims(mask,axis=0)
-    mask = torch.from_numpy(mask)
-
-    if args.invert_mask:
-        mask = ( (mask - 0.5) * -1) + 0.5
-    
-    mask = np.clip(mask,0,1)
-    return mask
 
 def sample_from_cv2(sample: np.ndarray) -> torch.Tensor:
     sample = ((sample.astype(float) / 255.0) * 2) - 1
@@ -474,92 +512,14 @@ def sample_to_cv2(sample: torch.Tensor, type=np.uint8) -> np.ndarray:
     sample_int8 = (sample_f32 * 255)
     return sample_int8.astype(type)
 
-@torch.no_grad()
-def predict_depth(prev_img_cv2, adabins_helper, midas_model, midas_transform, anim_args) -> torch.Tensor:
-    w, h = prev_img_cv2.shape[1], prev_img_cv2.shape[0]
-
-    # predict depth with AdaBins    
-    use_adabins = anim_args.midas_weight < 1.0 and adabins_helper is not None
-    if use_adabins:
-        MAX_ADABINS_AREA = 500000
-        MIN_ADABINS_AREA = 448*448
-
-        # resize image if too large or too small
-        img_pil = Image.fromarray(cv2.cvtColor(prev_img_cv2.astype(np.uint8), cv2.COLOR_RGB2BGR))
-        image_pil_area = w*h
-        resized = True
-        if image_pil_area > MAX_ADABINS_AREA:
-            scale = math.sqrt(MAX_ADABINS_AREA) / math.sqrt(image_pil_area)
-            depth_input = img_pil.resize((int(w*scale), int(h*scale)), Image.LANCZOS) # LANCZOS is good for downsampling
-            print(f"  resized to {depth_input.width}x{depth_input.height}")
-        elif image_pil_area < MIN_ADABINS_AREA:
-            scale = math.sqrt(MIN_ADABINS_AREA) / math.sqrt(image_pil_area)
-            depth_input = img_pil.resize((int(w*scale), int(h*scale)), Image.BICUBIC)
-            print(f"  resized to {depth_input.width}x{depth_input.height}")
-        else:
-            depth_input = img_pil
-            resized = False
-
-        # predict depth and resize back to original dimensions
-        try:
-            _, adabins_depth = adabins_helper.predict_pil(depth_input)
-            if resized:
-                adabins_depth = TF.resize(
-                    torch.from_numpy(adabins_depth), 
-                    torch.Size([h, w]),
-                    interpolation=TF.InterpolationMode.BICUBIC
-                )
-            adabins_depth = adabins_depth.squeeze()
-        except:
-            print(f"  exception encountered, falling back to pure MiDaS")
-            use_adabins = False
-        torch.cuda.empty_cache()
-
-    if midas_model is not None:
-        # convert image from 0->255 uint8 to 0->1 float for feeding to MiDaS
-        img_midas = prev_img_cv2.astype(np.float32) / 255.0
-        img_midas_input = midas_transform({"image": img_midas})["image"]
-
-        # MiDaS depth estimation implementation
-        sample = torch.from_numpy(img_midas_input).float().to(device).unsqueeze(0)
-        if device == torch.device("cuda"):
-            sample = sample.to(memory_format=torch.channels_last)  
-            sample = sample.half()
-        midas_depth = midas_model.forward(sample)
-        midas_depth = torch.nn.functional.interpolate(
-            midas_depth.unsqueeze(1),
-            size=img_midas.shape[:2],
-            mode="bicubic",
-            align_corners=False,
-        ).squeeze()
-        midas_depth = midas_depth.cpu().numpy()
-        torch.cuda.empty_cache()
-
-        # MiDaS makes the near values greater, and the far values lesser. Let's reverse that and try to align with AdaBins a bit better.
-        midas_depth = np.subtract(50.0, midas_depth)
-        midas_depth = midas_depth / 19.0
-
-        # blend between MiDaS and AdaBins predictions
-        if use_adabins:
-            depth_map = midas_depth*anim_args.midas_weight + adabins_depth*(1.0-anim_args.midas_weight)
-        else:
-            depth_map = midas_depth
-
-        depth_map = np.expand_dims(depth_map, axis=0)
-        depth_tensor = torch.from_numpy(depth_map).squeeze().to(device)
-    else:
-        depth_tensor = torch.ones((h, w), device=device)
-    
-    return depth_tensor
-
 def transform_image_3d(prev_img_cv2, depth_tensor, rot_mat, translate, anim_args):
     # adapted and optimized version of transform_image_3d from Disco Diffusion https://github.com/alembics/disco-diffusion 
     w, h = prev_img_cv2.shape[1], prev_img_cv2.shape[0]
 
-    pixel_aspect = 1.0 # aspect of an individual pixel (so usually 1.0)
+    aspect_ratio = float(w)/float(h)
     near, far, fov_deg = anim_args.near_plane, anim_args.far_plane, anim_args.fov
-    persp_cam_old = p3d.FoVPerspectiveCameras(near, far, pixel_aspect, fov=fov_deg, degrees=True, device=device)
-    persp_cam_new = p3d.FoVPerspectiveCameras(near, far, pixel_aspect, fov=fov_deg, degrees=True, R=rot_mat, T=torch.tensor([translate]), device=device)
+    persp_cam_old = p3d.FoVPerspectiveCameras(near, far, aspect_ratio, fov=fov_deg, degrees=True, device=device)
+    persp_cam_new = p3d.FoVPerspectiveCameras(near, far, aspect_ratio, fov=fov_deg, degrees=True, R=rot_mat, T=torch.tensor([translate]), device=device)
 
     # range of [-1,1] is important to torch grid_sample's padding handling
     y,x = torch.meshgrid(torch.linspace(-1.,1.,h,dtype=torch.float32,device=device),torch.linspace(-1.,1.,w,dtype=torch.float32,device=device))
@@ -592,48 +552,98 @@ def transform_image_3d(prev_img_cv2, depth_tensor, rot_mat, translate, anim_args
     ).cpu().numpy().astype(prev_img_cv2.dtype)
     return result
 
+
+## CLIP -----------------------------------------
+
+class MakeCutouts(nn.Module):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
+        super().__init__()
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow
+
+    def forward(self, input):
+        sideY, sideX = input.shape[2:4]
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, self.cut_size)
+        cutouts = []
+        for _ in range(self.cutn):
+            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
+            offsetx = torch.randint(0, sideX - size + 1, ())
+            offsety = torch.randint(0, sideY - size + 1, ())
+            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
+        return torch.cat(cutouts)
+
+
+def spherical_dist_loss(x, y):
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+
+
+def clip_cond_fn(denoised, sigma, **kwargs):
+    clip_in = normalize(make_cutouts(denoised.add(1).div(2)))
+    image_embeds = clip_model.encode_image(clip_in).float()
+    dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
+    dists = dists.view([cutn, 1, -1])
+    losses = dists.mul(weights).sum(2).mean(0)
+    return losses.sum()
+
+## CLIP -----------------------------------------
+
 def generate(args, return_latent=False, return_sample=False, return_c=False):
     seed_everything(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
 
-    if args.sampler == 'plms':
-        sampler = PLMSSampler(model)
-    else:
-        sampler = DDIMSampler(model)
-
-    model_wrap = CompVisDenoiser(model)       
+    sampler = PLMSSampler(model) if args.sampler == 'plms' else DDIMSampler(model)
+    model_wrap = CompVisDenoiser(model)
     batch_size = args.n_samples
     prompt = args.prompt
     assert prompt is not None
     data = [batch_size * [prompt]]
+    precision_scope = autocast if args.precision == "autocast" else nullcontext
 
     init_latent = None
+    mask_image = None
+    init_image = None
     if args.init_latent is not None:
         init_latent = args.init_latent
     elif args.init_sample is not None:
-        init_latent = model.get_first_stage_encoding(model.encode_first_stage(args.init_sample))
+        with precision_scope("cuda"):
+            init_latent = model.get_first_stage_encoding(model.encode_first_stage(args.init_sample))
     elif args.use_init and args.init_image != None and args.init_image != '':
-        init_image = load_img(args.init_image, shape=(args.W, args.H)).to(device)
+        init_image, mask_image = load_img(args.init_image, 
+                                          shape=(args.W, args.H),  
+                                          use_alpha_as_mask=args.use_alpha_as_mask)
+        init_image = init_image.to(device)
         init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
-        init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space        
+        with precision_scope("cuda"):
+            init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space        
 
-    if not args.use_init and args.strength > 0:
-        print("\nNo init image, but strength > 0. This may give you some strange results.\n")
+    if not args.use_init and args.strength > 0 and args.strength_0_no_init:
+        print("\nNo init image, but strength > 0. Strength has been auto set to 0, since use_init is False.")
+        print("If you want to force strength > 0 with no init, please set strength_0_no_init to False.\n")
+        args.strength = 0
 
     # Mask functions
-    mask = None
     if args.use_mask:
-        assert args.mask_file is not None, "use_mask==True: An mask image is required for a mask"
+        assert args.mask_file is not None or mask_image is not None, "use_mask==True: An mask image is required for a mask. Please enter a mask_file or use an init image with an alpha channel"
         assert args.use_init, "use_mask==True: use_init is required for a mask"
         assert init_latent is not None, "use_mask==True: An latent init image is required for a mask"
 
-        mask = prepare_mask(args.mask_file, 
+        mask = prepare_mask(args.mask_file if mask_image is None else mask_image, 
                             init_latent.shape, 
                             args.mask_contrast_adjust, 
                             args.mask_brightness_adjust)
         
+        if (torch.all(mask == 0) or torch.all(mask == 1)) and args.use_alpha_as_mask:
+            raise Warning("use_alpha_as_mask==True: Using the alpha channel from the init image as a mask, but the alpha channel is blank.")
+        
         mask = mask.to(device)
         mask = repeat(mask, '1 ... -> b ...', b=batch_size)
+    else:
+        mask = None
         
     t_enc = int((1.0-args.strength) * args.steps)
 
@@ -644,27 +654,24 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
-    if args.init_mse_scale > 0 and init_latent is None:
-        raise Exception("Cannot use mse loss without an init image")
 
     cond_fns = [
-        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale > 0 else None,
-        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, verbose=True) if args.init_mse_scale > 0 else None,
+        make_cond_fn(clip_cond_fn, args.clip_loss_scale, wrt=args.gradient_wrt, verbose=False) if args.clip_loss_scale != 0 else None,
+        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale != 0 else None,
+        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, verbose=True) if args.init_mse_scale != 0 else None,
         ]
 
-    callback = make_callback(sampler_name=args.sampler,
-                            dynamic_threshold=args.dynamic_threshold, 
-                            static_threshold=args.static_threshold,
+
+    clamp_func = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+
+    callback = SamplerCallback(args=args,
                             mask=mask, 
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            cond_fns=cond_fns)    
-
-     
+                            verbose=True).callback   
 
     results = []
-    precision_scope = autocast if args.precision == "autocast" else nullcontext
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
@@ -687,10 +694,17 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             model_wrap=model_wrap, 
                             init_latent=init_latent, 
                             t_enc=t_enc, 
+                            cond_fns=cond_fns,
+                            clamp_func=clamp_func,
                             device=device, 
-                            cb=callback)
+                            gradient_wrt=args.gradient_wrt,
+                            gradient_add_to=args.gradient_add_to,
+                            cond_uncond_sync=args.cond_uncond_sync,
+                            cb=callback,
+                            verbose=False)
                     else:
                         # args.sampler == 'plms' or args.sampler == 'ddim':
+                        #TODO Implement conditioning for ddim and plms samplers
                         if init_latent is not None and args.strength > 0:
                             z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
                         else:
@@ -820,7 +834,7 @@ def load_model_from_config(config, ckpt, verbose=False, device='cuda', half_prec
 
 if load_on_run_all and ckpt_valid:
     local_config = OmegaConf.load(f"{ckpt_config_path}")
-    model = load_model_from_config(local_config, f"{ckpt_path}",half_precision=half_precision)
+    model = load_model_from_config(local_config, f"{ckpt_path}", half_precision=half_precision)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
 
@@ -868,7 +882,7 @@ def DeforumAnimArgs():
 
     #@markdown ####**Coherence:**
     color_coherence = 'Match Frame 0 LAB' #@param ['None', 'Match Frame 0 HSV', 'Match Frame 0 LAB', 'Match Frame 0 RGB'] {type:'string'}
-    diffusion_cadence = '3' #@param ['1','2','3','4','5','6','7','8'] {type:'string'}
+    diffusion_cadence = '1' #@param ['1','2','3','4','5','6','7','8'] {type:'string'}
 
     #@markdown ####**3D Depth Warping:**
     use_depth_warping = True #@param {type:"boolean"}
@@ -878,6 +892,7 @@ def DeforumAnimArgs():
     fov = 40#@param {type:"number"}
     padding_mode = 'border'#@param ['border', 'reflection', 'zeros'] {type:'string'}
     sampling_mode = 'bicubic'#@param ['bicubic', 'bilinear', 'nearest'] {type:'string'}
+    save_depth_maps = False #@param {type:"boolean"}
 
     #@markdown ####**Video Input:**
     video_init_path ='/content/video_in.mp4'#@param {type:"string"}
@@ -895,21 +910,21 @@ def DeforumAnimArgs():
 
 class DeformAnimKeys():
     def __init__(self, anim_args):
-        self.angle_series = get_inbetweens(parse_key_frames(anim_args.angle))
-        self.zoom_series = get_inbetweens(parse_key_frames(anim_args.zoom))
-        self.translation_x_series = get_inbetweens(parse_key_frames(anim_args.translation_x))
-        self.translation_y_series = get_inbetweens(parse_key_frames(anim_args.translation_y))
-        self.translation_z_series = get_inbetweens(parse_key_frames(anim_args.translation_z))
-        self.rotation_3d_x_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_x))
-        self.rotation_3d_y_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_y))
-        self.rotation_3d_z_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_z))
-        self.noise_schedule_series = get_inbetweens(parse_key_frames(anim_args.noise_schedule))
-        self.strength_schedule_series = get_inbetweens(parse_key_frames(anim_args.strength_schedule))
-        self.contrast_schedule_series = get_inbetweens(parse_key_frames(anim_args.contrast_schedule))
+        self.angle_series = get_inbetweens(parse_key_frames(anim_args.angle), anim_args.max_frames)
+        self.zoom_series = get_inbetweens(parse_key_frames(anim_args.zoom), anim_args.max_frames)
+        self.translation_x_series = get_inbetweens(parse_key_frames(anim_args.translation_x), anim_args.max_frames)
+        self.translation_y_series = get_inbetweens(parse_key_frames(anim_args.translation_y), anim_args.max_frames)
+        self.translation_z_series = get_inbetweens(parse_key_frames(anim_args.translation_z), anim_args.max_frames)
+        self.rotation_3d_x_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_x), anim_args.max_frames)
+        self.rotation_3d_y_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_y), anim_args.max_frames)
+        self.rotation_3d_z_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_z), anim_args.max_frames)
+        self.noise_schedule_series = get_inbetweens(parse_key_frames(anim_args.noise_schedule), anim_args.max_frames)
+        self.strength_schedule_series = get_inbetweens(parse_key_frames(anim_args.strength_schedule), anim_args.max_frames)
+        self.contrast_schedule_series = get_inbetweens(parse_key_frames(anim_args.contrast_schedule), anim_args.max_frames)
 
 
-def get_inbetweens(key_frames, integer=False, interp_method='Linear'):
-    key_frame_series = pd.Series([np.nan for a in range(anim_args.max_frames)])
+def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'):
+    key_frame_series = pd.Series([np.nan for a in range(max_frames)])
 
     for i, value in key_frames.items():
         key_frame_series[i] = value
@@ -921,8 +936,8 @@ def get_inbetweens(key_frames, integer=False, interp_method='Linear'):
       interp_method = 'Linear'
           
     key_frame_series[0] = key_frame_series[key_frame_series.first_valid_index()]
-    key_frame_series[anim_args.max_frames-1] = key_frame_series[key_frame_series.last_valid_index()]
-    key_frame_series = key_frame_series.interpolate(method=interp_method.lower(),limit_direction='both')
+    key_frame_series[max_frames-1] = key_frame_series[key_frame_series.last_valid_index()]
+    key_frame_series = key_frame_series.interpolate(method=interp_method.lower(), limit_direction='both')
     if integer:
         return key_frame_series.astype(int)
     return key_frame_series
@@ -980,6 +995,65 @@ animation_prompts = {
 
 # %%
 # !! {"metadata":{
+# !!   "id": "2ibI5xBo-HZs"
+# !! }}
+import clip
+from torchvision import transforms
+from torch.nn import functional as F
+
+# %%
+# !! {"metadata":{
+# !!   "id": "yZEhWtuC9saB"
+# !! }}
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print('Using device:', device)
+
+clip_name = 'ViT-L/14@336px' #'ViT-B/16' #'ViT-L/14' # 
+clip_model = clip.load(clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
+clip_size = clip_model.visual.input_resolution
+normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                 std=[0.26862954, 0.26130258, 0.27577711])
+
+# %%
+# !! {"metadata":{
+# !!   "id": "5AFKxKKM9wKS"
+# !! }}
+cutn = 1
+cut_pow = 0.0001
+
+def parse_prompt(prompt):
+    if prompt.startswith('http://') or prompt.startswith('https://'):
+        vals = prompt.rsplit(':', 2)
+        vals = [vals[0] + ':' + vals[1], *vals[2:]]
+    else:
+        vals = prompt.rsplit(':', 1)
+    vals = vals + ['', '1'][len(vals):]
+    return vals[0], float(vals[1])
+
+clip_prompts = ['hyperdetailed matte illustration geometric pattern']
+
+target_embeds, weights = [], []
+
+for prompt in clip_prompts:
+    txt, weight = parse_prompt(prompt)
+    target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
+    weights.append(weight)
+
+if clip_name == 'ViT-L/14@336px':
+  cutout_size = 336
+else:
+  cutout_size = 224
+make_cutouts = MakeCutouts(cutout_size, cutn, cut_pow)
+
+target_embeds = torch.cat(target_embeds)
+weights = torch.tensor(weights, device=device)
+if weights.sum().abs() < 1e-3:
+    raise RuntimeError('The weights must not sum to 0.')
+weights /= weights.sum().abs()
+
+
+# %%
+# !! {"metadata":{
 # !!   "id": "qH74gBWDd2oq",
 # !!   "cellView": "form"
 # !! }}
@@ -1001,8 +1075,11 @@ def DeforumArgs():
 
     #@markdown **Save & Display Settings**
     save_samples = True #@param {type:"boolean"}
+    save_sample_per_step = True #@param {type:"boolean"}
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
+    save_sample_per_step = True #@param {type:"boolean"}
+    show_sample_per_step = True #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
     n_batch = 1 #@param
@@ -1016,9 +1093,11 @@ def DeforumArgs():
     #@markdown **Init Settings**
     use_init = False #@param {type:"boolean"}
     strength = 0.0 #@param {type:"number"}
+    strength_0_no_init = True # Set the strength to 0 automatically when no init image is used
     init_image = "https://cdn.pixabay.com/photo/2022/07/30/13/10/green-longhorn-beetle-7353749_1280.jpg" #@param {type:"string"}
     # Whiter areas of the mask are areas that change more
     use_mask = False #@param {type:"boolean"}
+    use_alpha_as_mask = False # use the alpha channel of the init image as the mask
     mask_file = "https://www.filterforge.com/wiki/images/archive/b/b7/20080927223728%21Polygonal_gradient_thumb.jpg" #@param {type:"string"}
     invert_mask = False #@param {type:"boolean"}
     # Adjust mask image, 1.0 is no adjustment. Should be positive numbers.
@@ -1026,8 +1105,16 @@ def DeforumArgs():
     mask_contrast_adjust = 1.0  #@param {type:"number"}
 
     #@markdown **Conditioning Settings**
-    blue_loss_scale = 200 #@param {type:"number"}
-    init_mse_scale = 200 #@param {type:"number"}
+    blue_loss_scale = 0 #@param {type:"number"}
+    init_mse_scale = 0 #@param {type:"number"}
+    clip_loss_scale = 1000 #@param {type:"number"}
+    clamp_grad_threshold = 0.01 #@param {type:"number"}
+    grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
+    gradient_wrt = 'x' #@param ["x", "x0_pred"]
+    gradient_add_to = 'cond' #@param ["cond", "uncond", "both"]
+
+    #@markdown **Speed vs VRAM Settings**
+    cond_uncond_sync = False #@param {type:"boolean"}
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
@@ -1169,12 +1256,15 @@ def render_animation(args, anim_args):
     using_vid_init = anim_args.animation_mode == 'Video Input'
 
     # load depth model for 3D
-    if anim_args.animation_mode == '3D' and anim_args.use_depth_warping:
-        download_depth_models()
-        adabins_helper = InferenceHelper(dataset='nyu', device=device)
-        midas_model, midas_transform = load_depth_model()
+    predict_depths = (anim_args.animation_mode == '3D' and anim_args.use_depth_warping) or anim_args.save_depth_maps
+    if predict_depths:
+        depth_model = DepthModel(device)
+        depth_model.load_midas(models_path)
+        if anim_args.midas_weight < 1.0:
+            depth_model.load_adabins()
     else:
-        adabins_helper, midas_model, midas_transform = None, None, None
+        depth_model = None
+        anim_args.save_depth_maps = False
 
     # state for interpolating between diffusion steps
     turbo_steps = 1 if using_vid_init else int(anim_args.diffusion_cadence)
@@ -1206,6 +1296,7 @@ def render_animation(args, anim_args):
         noise = keys.noise_schedule_series[frame_idx]
         strength = keys.strength_schedule_series[frame_idx]
         contrast = keys.contrast_schedule_series[frame_idx]
+        depth = None
         
         # emit in-between frames
         if turbo_steps > 1:
@@ -1213,18 +1304,24 @@ def render_animation(args, anim_args):
             for tween_frame_idx in range(tween_frame_start_idx, frame_idx):
                 tween = float(tween_frame_idx - tween_frame_start_idx + 1) / float(frame_idx - tween_frame_start_idx)
                 print(f"  creating in between frame {tween_frame_idx} tween:{tween:0.2f}")
+
+                advance_prev = turbo_prev_image is not None and tween_frame_idx > turbo_prev_frame_idx
+                advance_next = tween_frame_idx > turbo_next_frame_idx
+
+                if depth_model is not None:
+                    assert(turbo_next_image is not None)
+                    depth = depth_model.predict(turbo_next_image, anim_args)
+
                 if anim_args.animation_mode == '2D':
-                    if turbo_prev_image is not None and tween_frame_idx > turbo_prev_frame_idx:
+                    if advance_prev:
                         turbo_prev_image = anim_frame_warp_2d(turbo_prev_image, args, anim_args, keys, tween_frame_idx)
-                    if tween_frame_idx > turbo_next_frame_idx:
+                    if advance_next:
                         turbo_next_image = anim_frame_warp_2d(turbo_next_image, args, anim_args, keys, tween_frame_idx)
                 else: # '3D'
-                    if turbo_prev_image is not None and tween_frame_idx > turbo_prev_frame_idx:
-                        prev_depth = predict_depth(turbo_prev_image, adabins_helper, midas_model, midas_transform, anim_args)
-                        turbo_prev_image = anim_frame_warp_3d(turbo_prev_image, prev_depth, anim_args, keys, tween_frame_idx)
-                    if tween_frame_idx > turbo_next_frame_idx:
-                        next_depth = predict_depth(turbo_next_image, adabins_helper, midas_model, midas_transform, anim_args)
-                        turbo_next_image = anim_frame_warp_3d(turbo_next_image, next_depth, anim_args, keys, tween_frame_idx)
+                    if advance_prev:
+                        turbo_prev_image = anim_frame_warp_3d(turbo_prev_image, depth, anim_args, keys, tween_frame_idx)
+                    if advance_next:
+                        turbo_next_image = anim_frame_warp_3d(turbo_next_image, depth, anim_args, keys, tween_frame_idx)
                 turbo_prev_frame_idx = turbo_next_frame_idx = tween_frame_idx
 
                 if turbo_prev_image is not None and tween < 1.0:
@@ -1234,6 +1331,8 @@ def render_animation(args, anim_args):
 
                 filename = f"{args.timestring}_{tween_frame_idx:05}.png"
                 cv2.imwrite(os.path.join(args.outdir, filename), cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_RGB2BGR))
+                if anim_args.save_depth_maps:
+                    depth_model.save(os.path.join(args.outdir, f"{args.timestring}_depth_{tween_frame_idx:05}.png"), depth)
             if turbo_next_image is not None:
                 prev_sample = sample_from_cv2(turbo_next_image)
 
@@ -1243,7 +1342,7 @@ def render_animation(args, anim_args):
                 prev_img = anim_frame_warp_2d(sample_to_cv2(prev_sample), args, anim_args, keys, frame_idx)
             else: # '3D'
                 prev_img_cv2 = sample_to_cv2(prev_sample)
-                depth = predict_depth(prev_img_cv2, adabins_helper, midas_model, midas_transform, anim_args)
+                depth = depth_model.predict(prev_img_cv2, anim_args) if depth_model else None
                 prev_img = anim_frame_warp_3d(prev_img_cv2, depth, anim_args, keys, frame_idx)
 
             # apply color matching
@@ -1288,6 +1387,10 @@ def render_animation(args, anim_args):
         else:    
             filename = f"{args.timestring}_{frame_idx:05}.png"
             image.save(os.path.join(args.outdir, filename))
+            if anim_args.save_depth_maps:
+                if depth is None:
+                    depth = depth_model.predict(sample_to_cv2(sample), anim_args)
+                depth_model.save(os.path.join(args.outdir, f"{args.timestring}_depth_{frame_idx:05}.png"), depth)
             frame_idx += 1
 
         display.clear_output(wait=True)
@@ -1298,7 +1401,7 @@ def render_animation(args, anim_args):
 def render_input_video(args, anim_args):
     # create a folder for the video input frames to live in
     video_in_frame_path = os.path.join(args.outdir, 'inputframes') 
-    os.makedirs(os.path.join(args.outdir, video_in_frame_path), exist_ok=True)
+    os.makedirs(video_in_frame_path, exist_ok=True)
     
     # save the video frames from input video
     print(f"Exporting Video Frames (1 every {anim_args.extract_nth_frame}) frames to {video_in_frame_path}...")
@@ -1444,6 +1547,10 @@ if anim_args.animation_mode == 'None':
 elif anim_args.animation_mode == 'Video Input':
     args.use_init = True
 
+# clean up unused memory
+gc.collect()
+torch.cuda.empty_cache()
+
 # dispatch to appropriate renderer
 if anim_args.animation_mode == '2D' or anim_args.animation_mode == '3D':
     render_animation(args, anim_args)
@@ -1472,7 +1579,9 @@ fps = 12 #@param {type:"number"}
 #@markdown **Manual Settings**
 use_manual_settings = False #@param {type:"boolean"}
 image_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939_%05d.png" #@param {type:"string"}
-mp4_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939.mp4" #@param {type:"string"}
+mp4_path = "/content/drive/MyDrive/AI/StableDiffu'/content/drive/MyDrive/AI/StableDiffusion/2022-09/sion/2022-09/20220903000939.mp4" #@param {type:"string"}
+render_steps = True  #@param {type: 'boolean'}
+path_name_modifier = "x0_pred" #@param ["x0_pred", "x0_pred_sample", "guided_diff", "x0_pred_orig", "x0_pred_sample_orig"]
 
 
 if skip_video_for_run_all == True:
@@ -1487,9 +1596,18 @@ else:
     if use_manual_settings:
         max_frames = "200" #@param {type:"string"}
     else:
-        image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
-        mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
-        max_frames = str(anim_args.max_frames)
+        if render_steps: # render steps from a single image
+            fname = f"%03d_{path_name_modifier}.png"
+            all_step_dirs = [os.path.join(args.outdir, d) for d in os.listdir(args.outdir) if os.path.isdir(os.path.join(args.outdir,d))]
+            newest_dir = max(all_step_dirs, key=os.path.getmtime)
+            image_path = os.path.join(newest_dir, fname)
+            print(image_path)
+            mp4_path = os.path.join(newest_dir, f"{args.timestring}_{args.}_{path_name_modifier}.mp4")
+            max_frames = str(args.steps)
+        else: # render images for a video
+            image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
+            mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
+            max_frames = str(anim_args.max_frames)
 
     # make video
     cmd = [
@@ -1506,6 +1624,7 @@ else:
         '-pix_fmt', 'yuv420p',
         '-crf', '17',
         '-preset', 'veryfast',
+        '-pattern_type', 'sequence',
         mp4_path
     ]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
