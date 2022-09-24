@@ -136,6 +136,7 @@ from torchvision.utils import make_grid
 from tqdm import tqdm, trange
 from types import SimpleNamespace
 from torch import autocast
+from sklearn.cluster import KMeans
 
 sys.path.extend([
     'src/taming-transformers',
@@ -207,7 +208,7 @@ def get_output_folder(output_path, batch_folder):
     os.makedirs(out_path, exist_ok=True)
     return out_path
 
-def load_img(path, shape, use_alpha_as_mask=False):
+def load_img(path, shape=None, use_alpha_as_mask=False):
     # use_alpha_as_mask: Read the alpha channel of the image as the mask image
     if path.startswith('http://') or path.startswith('https://'):
         image = Image.open(requests.get(path, stream=True).raw)
@@ -219,7 +220,8 @@ def load_img(path, shape, use_alpha_as_mask=False):
     else:
         image = image.convert('RGB')
 
-    image = image.resize(shape, resample=Image.LANCZOS)
+    if shape is not None:
+        image = image.resize(shape, resample=Image.LANCZOS)
 
     mask_image = None
     if use_alpha_as_mask:
@@ -313,6 +315,53 @@ def make_mse_loss(target):
     return mse_loss
 
 
+def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None):
+
+    assert n_colors > 0, "Must use at least one color"
+
+    def display_color_palette(color_list):
+        # Expand to 64x64 grid of color pixels
+        images = color_list.unsqueeze(2).repeat(1,1,64).unsqueeze(3).repeat(1,1,1,64)
+        images = images.double().cpu().add(1).div(2).clamp(0, 1)
+        images = torch.tensor(np.array(images))
+        grid = make_grid(images, 8).cpu()
+        display.display(TF.to_pil_image(grid))
+        return
+
+    if ignore_sat_scale is None:
+        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
+    else:
+        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(TF.adjust_saturation(target[0].float(),ignore_sat_scale),1,2).T.cpu().numpy())
+    color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
+    display_color_palette(color_list)
+    print('color_list',color_list)
+    # Get ratio of each color class in the target image
+    color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
+    color_list = color_list[color_indexes]
+    color_ratios = color_counts / torch.sum(torch.Tensor(color_counts))
+    print('color_ratios',color_ratios)
+
+
+    def rgb_color_match_loss(x, sigma, **kwargs):
+        min_color_norm_distances = torch.ones(x.shape).to(device) * 2.0 # difference won't be more than 2 if values are between -1 and 1
+        for color in color_list:
+            color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
+            if ignore_sat_scale is None:
+                color_distances = torch.linalg.norm(x - color,  dim=1)
+            else:
+                color_distances = torch.linalg.norm(TF.adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
+            min_color_norm_distances = torch.minimum(min_color_norm_distances,color_distances)
+
+        # # Get ratio of each color class
+        # # get the class of each
+        # color_classes = ... WIP. Might have to use Wasserstein metric instead for color ratios
+        # color_counts = torch.unique(color_classes, return_counts=True)
+        
+        return min_color_norm_distances.square().mean()
+
+    return rgb_color_match_loss
+
+
 ###
 # Thresholding functions for grad
 ###
@@ -349,18 +398,49 @@ def threshold_by(threshold, threshold_type):
 ###
 # Conditioning helper functions
 ###
+# Decodes the image without passing through the upscaler. The resulting image will be the same size as the latent
+# Thanks to Kevin Turner (https://github.com/keturn) we have a shortcut to look at the decoded image!
+def make_simple_decode(model_name, device='cuda:0'):
+    v1_4_rgb_latent_factors = [
+        #   R       G       B
+        [ 0.298,  0.207,  0.208],  # L1
+        [ 0.187,  0.286,  0.173],  # L2
+        [-0.158,  0.189,  0.264],  # L3
+        [-0.184, -0.271, -0.473],  # L4
+    ]
 
-def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
+    if model_name == "sd-v1-4":
+        rgb_latent_factors = torch.Tensor(v1_4_rgb_latent_factors).to(device)
+    else:
+      raise Exception(f"Model name {model_name} not recognized.")
+
+    def simple_decode(latent):
+        latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
+        latent_image = latent_image.permute(0, 3, 1, 2)
+        return latent_image
+    
+    return simple_decode
+
+
+def make_cond_fn(loss_fn, scale, wrt='x', decode_method=None, verbose=False):
     # Turns a loss function into a cond function that is applied to the decoded RGB sample
     # loss_fn (function): func(x, sigma, denoised) -> number
     # scale (number): how much this loss is applied to the image
     # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
+    # decode_method (str): ['autoencoder','linear'] method to decode the latent to an image
     if wrt is None:
         wrt = 'x'
 
+    if decode_method is None:
+        decode_func = lambda x: x
+    elif decode_method == "autoencoder":
+        decode_func = model.differentiable_decode_first_stage
+    elif decode_method == "linear":
+        decode_func = simple_decode
+
     def cond_fn(x, sigma, denoised, **kwargs):
         with torch.enable_grad():
-            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            denoised_sample = decode_func(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
             grad = -torch.autograd.grad(loss, x)[0]
         verbose_print('Loss:', loss.item())
@@ -368,7 +448,7 @@ def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
 
     def cond_fn_pred(x, sigma, denoised, **kwargs):
         with torch.enable_grad():
-            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            denoised_sample = decode_func(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
             grad = -torch.autograd.grad(loss, denoised)[0]
         verbose_print('Loss:', loss.item())
@@ -476,8 +556,9 @@ class SamplerCallback(object):
             args_dict['x'].copy_(new_img)
 
         if self.verbose:
-            self.view_sample_step(args_dict['denoised'], "x0_pred")
-            self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
+            # self.view_sample_step(args_dict['denoised'], "x0_pred")
+            # self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
+            self.view_sample_step(simple_decode(args_dict['denoised']), "x0_pred_simpledecode")
 
     # Callback for Compvis samplers
     # Function that is called on the image (img) and step (i) at each step
@@ -582,8 +663,8 @@ def spherical_dist_loss(x, y):
     return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
 
 
-def clip_cond_fn(denoised, sigma, **kwargs):
-    clip_in = normalize(make_cutouts(denoised.add(1).div(2)))
+def clip_loss_fn(x, sigma, **kwargs):
+    clip_in = normalize(make_cutouts(x.add(1).div(2)))
     image_embeds = clip_model.encode_image(clip_in).float()
     dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
     dists = dists.view([cutn, 1, -1])
@@ -654,11 +735,19 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
+    if args.colormatch_loss_scale != 0:
+        assert args.colormatch_image is not None, "If using color match loss, colormatch_image is needed"
+        colormatch_image, _ = load_img(args.colormatch_image, shape=(64,64))
+        colormatch_image = colormatch_image.to('cpu')
+        del(_)
+    else:
+        colormatch_image = None
 
     cond_fns = [
-        make_cond_fn(clip_cond_fn, args.clip_loss_scale, wrt=args.gradient_wrt, verbose=False) if args.clip_loss_scale != 0 else None,
-        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale != 0 else None,
-        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, verbose=True) if args.init_mse_scale != 0 else None,
+        make_cond_fn(clip_loss_fn, args.clip_loss_scale, wrt=args.gradient_wrt, decode_method=args.decode_method, verbose=False) if args.clip_loss_scale != 0 else None,
+        make_cond_fn(blue_loss_fn, args.blue_loss_scale, decode_method=args.decode_method, verbose=True) if args.blue_loss_scale != 0 else None,
+        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, decode_method=args.decode_method, verbose=True) if args.init_mse_scale != 0 else None,
+        make_cond_fn(make_rgb_color_match_loss(colormatch_image, n_colors=args.colormatch_n_colors, ignore_sat_scale=args.ignore_sat_scale), args.colormatch_loss_scale, decode_method=args.decode_method, verbose=True) if args.colormatch_loss_scale != 0 else None,
         ]
 
 
@@ -838,6 +927,9 @@ if load_on_run_all and ckpt_valid:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
 
+#TODO Get model name information to use linear decoder that is specific for the model
+simple_decode = make_simple_decode(model_checkpoint.split('.')[0], device)
+
 # %%
 # !! {"metadata":{
 # !!   "id": "ov3r4RD1tzsT"
@@ -1008,9 +1100,9 @@ from torch.nn import functional as F
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print('Using device:', device)
 
-clip_name = 'ViT-L/14@336px' #'ViT-B/16' #'ViT-L/14' # 
+clip_name = 'ViT-L/14' # 'ViT-L/14@336px' #'ViT-B/16' #
 clip_model = clip.load(clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
-clip_size = clip_model.visual.input_resolution
+clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
 normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711])
 
@@ -1039,10 +1131,8 @@ for prompt in clip_prompts:
     target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
     weights.append(weight)
 
-if clip_name == 'ViT-L/14@336px':
-  cutout_size = 336
-else:
-  cutout_size = 224
+cutout_size = clip_size
+
 make_cutouts = MakeCutouts(cutout_size, cutn, cut_pow)
 
 target_embeds = torch.cat(target_embeds)
@@ -1078,7 +1168,7 @@ def DeforumArgs():
     save_sample_per_step = True #@param {type:"boolean"}
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
-    save_sample_per_step = True #@param {type:"boolean"}
+    save_sample_per_step = False #@param {type:"boolean"}
     show_sample_per_step = True #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
@@ -1107,11 +1197,18 @@ def DeforumArgs():
     #@markdown **Conditioning Settings**
     blue_loss_scale = 0 #@param {type:"number"}
     init_mse_scale = 0 #@param {type:"number"}
-    clip_loss_scale = 1000 #@param {type:"number"}
-    clamp_grad_threshold = 0.01 #@param {type:"number"}
+    clip_loss_scale = 0 #@param {type:"number"}
+
+    colormatch_loss_scale = 800 #@param {type:"number"}
+    colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
+    colormatch_n_colors = 4 #@param {type:"number"}
+    clamp_grad_threshold = 0.2 #@param {type:"number"}
+    ignore_sat_scale = 5 #@param 
+
     grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
     gradient_wrt = 'x' #@param ["x", "x0_pred"]
     gradient_add_to = 'cond' #@param ["cond", "uncond", "both"]
+    decode_method = 'linear' #@param ["autoencoder","linear"]
 
     #@markdown **Speed vs VRAM Settings**
     cond_uncond_sync = False #@param {type:"boolean"}
