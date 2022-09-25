@@ -137,6 +137,7 @@ from tqdm import tqdm, trange
 from types import SimpleNamespace
 from torch import autocast
 from sklearn.cluster import KMeans
+from scipy.ndimage import gaussian_filter
 
 sys.path.extend([
     'src/taming-transformers',
@@ -161,6 +162,120 @@ def sanitize(prompt):
     tmp = ''.join(filter(whitelist.__contains__, prompt))
     return tmp.replace(' ', '_')
 
+from functools import reduce
+def construct_RotationMatrixHomogenous(rotation_angles):
+    assert(type(rotation_angles)==list and len(rotation_angles)==3)
+    RH = np.eye(4,4)
+    cv2.Rodrigues(np.array(rotation_angles), RH[0:3, 0:3])
+    return RH
+
+# https://en.wikipedia.org/wiki/Rotation_matrix
+def getRotationMatrixManual(rotation_angles):
+	
+    rotation_angles = [np.deg2rad(x) for x in rotation_angles]
+    
+    phi         = rotation_angles[0] # around x
+    gamma       = rotation_angles[1] # around y
+    theta       = rotation_angles[2] # around z
+    
+    # X rotation
+    Rphi        = np.eye(4,4)
+    sp          = np.sin(phi)
+    cp          = np.cos(phi)
+    Rphi[1,1]   = cp
+    Rphi[2,2]   = Rphi[1,1]
+    Rphi[1,2]   = -sp
+    Rphi[2,1]   = sp
+    
+    # Y rotation
+    Rgamma        = np.eye(4,4)
+    sg            = np.sin(gamma)
+    cg            = np.cos(gamma)
+    Rgamma[0,0]   = cg
+    Rgamma[2,2]   = Rgamma[0,0]
+    Rgamma[0,2]   = sg
+    Rgamma[2,0]   = -sg
+    
+    # Z rotation (in-image-plane)
+    Rtheta      = np.eye(4,4)
+    st          = np.sin(theta)
+    ct          = np.cos(theta)
+    Rtheta[0,0] = ct
+    Rtheta[1,1] = Rtheta[0,0]
+    Rtheta[0,1] = -st
+    Rtheta[1,0] = st
+    
+    R           = reduce(lambda x,y : np.matmul(x,y), [Rphi, Rgamma, Rtheta]) 
+    
+    return R
+
+
+def getPoints_for_PerspectiveTranformEstimation(ptsIn, ptsOut, W, H, sidelength):
+    
+    ptsIn2D      =  ptsIn[0,:]
+    ptsOut2D     =  ptsOut[0,:]
+    ptsOut2Dlist =  []
+    ptsIn2Dlist  =  []
+    
+    for i in range(0,4):
+        ptsOut2Dlist.append([ptsOut2D[i,0], ptsOut2D[i,1]])
+        ptsIn2Dlist.append([ptsIn2D[i,0], ptsIn2D[i,1]])
+    
+    pin  =  np.array(ptsIn2Dlist)   +  [W/2.,H/2.]
+    pout = (np.array(ptsOut2Dlist)  +  [1.,1.]) * (0.5*sidelength)
+    pin  = pin.astype(np.float32)
+    pout = pout.astype(np.float32)
+    
+    return pin, pout
+
+def warpMatrix(W, H, theta, phi, gamma, scale, fV):
+    
+    # M is to be estimated
+    M          = np.eye(4, 4)
+    
+    fVhalf     = np.deg2rad(fV/2.)
+    d          = np.sqrt(W*W+H*H)
+    sideLength = scale*d/np.cos(fVhalf)
+    h          = d/(2.0*np.sin(fVhalf))
+    n          = h-(d/2.0);
+    f          = h+(d/2.0);
+    
+    # Translation along Z-axis by -h
+    T       = np.eye(4,4)
+    T[2,3]  = -h
+    
+    # Rotation matrices around x,y,z
+    R = getRotationMatrixManual([phi, gamma, theta])
+    
+    
+    # Projection Matrix 
+    P       = np.eye(4,4)
+    P[0,0]  = 1.0/np.tan(fVhalf)
+    P[1,1]  = P[0,0]
+    P[2,2]  = -(f+n)/(f-n)
+    P[2,3]  = -(2.0*f*n)/(f-n)
+    P[3,2]  = -1.0
+    
+    # pythonic matrix multiplication
+    F       = reduce(lambda x,y : np.matmul(x,y), [P, T, R]) 
+    
+    # shape should be 1,4,3 for ptsIn and ptsOut since perspectiveTransform() expects data in this way. 
+    # In C++, this can be achieved by Mat ptsIn(1,4,CV_64FC3);
+    ptsIn = np.array([[
+                 [-W/2., H/2., 0.],[ W/2., H/2., 0.],[ W/2.,-H/2., 0.],[-W/2.,-H/2., 0.]
+                 ]])
+    ptsOut  = np.array(np.zeros((ptsIn.shape), dtype=ptsIn.dtype))
+    ptsOut  = cv2.perspectiveTransform(ptsIn, F)
+    
+    ptsInPt2f, ptsOutPt2f = getPoints_for_PerspectiveTranformEstimation(ptsIn, ptsOut, W, H, sideLength)
+    
+    # check float32 otherwise OpenCV throws an error
+    assert(ptsInPt2f.dtype  == np.float32)
+    assert(ptsOutPt2f.dtype == np.float32)
+    M33 = cv2.getPerspectiveTransform(ptsInPt2f,ptsOutPt2f)
+
+    return M33, sideLength
+
 def anim_frame_warp_2d(prev_img_cv2, args, anim_args, keys, frame_idx):
     angle = keys.angle_series[frame_idx]
     zoom = keys.zoom_series[frame_idx]
@@ -172,7 +287,18 @@ def anim_frame_warp_2d(prev_img_cv2, args, anim_args, keys, frame_idx):
     rot_mat = cv2.getRotationMatrix2D(center, angle, zoom)
     trans_mat = np.vstack([trans_mat, [0,0,1]])
     rot_mat = np.vstack([rot_mat, [0,0,1]])
-    xform = np.matmul(rot_mat, trans_mat)
+    if anim_args.flip_2d_perspective:
+        perspective_flip_theta = keys.perspective_flip_theta_series[frame_idx]
+        perspective_flip_phi = keys.perspective_flip_phi_series[frame_idx]
+        perspective_flip_gamma = keys.perspective_flip_gamma_series[frame_idx]
+        perspective_flip_fv = keys.perspective_flip_fv_series[frame_idx]
+        M,sl = warpMatrix(args.W, args.H, perspective_flip_theta, perspective_flip_phi, perspective_flip_gamma, 1., perspective_flip_fv);
+        post_trans_mat = np.float32([[1, 0, (args.W-sl)/2], [0, 1, (args.H-sl)/2]])
+        post_trans_mat = np.vstack([post_trans_mat, [0,0,1]])
+        bM = np.matmul(M, post_trans_mat)
+        xform = np.matmul(bM, rot_mat, trans_mat)
+    else:
+        xform = np.matmul(rot_mat, trans_mat)
 
     return cv2.warpPerspective(
         prev_img_cv2,
@@ -534,7 +660,7 @@ class SamplerCallback(object):
         return
 
     # The callback function is applied to the image at each step
-    def dynamic_thresholding_(img, threshold):
+    def dynamic_thresholding_(self, img, threshold):
         # Dynamic thresholding from Imagen paper (May 2022)
         s = np.percentile(np.abs(img.cpu()), threshold, axis=tuple(range(1,img.ndim)))
         s = np.max(np.append(s,1.0))
@@ -579,7 +705,6 @@ class SamplerCallback(object):
         if self.verbose:
             self.view_sample_step(img, "x0_pred")
             self.view_sample_step(model.decode_first_stage(img), "x0_pred_sample")
-
 
 def sample_from_cv2(sample: np.ndarray) -> torch.Tensor:
     sample = ((sample.astype(float) / 255.0) * 2) - 1
@@ -713,6 +838,7 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
         assert args.use_init, "use_mask==True: use_init is required for a mask"
         assert init_latent is not None, "use_mask==True: An latent init image is required for a mask"
 
+
         mask = prepare_mask(args.mask_file if mask_image is None else mask_image, 
                             init_latent.shape, 
                             args.mask_contrast_adjust, 
@@ -725,6 +851,8 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
         mask = repeat(mask, '1 ... -> b ...', b=batch_size)
     else:
         mask = None
+
+    assert not (args.overlay_mask == True and (args.init_sample is None and init_image is None)), "Need an init image when overlay_mask == True"
         
     t_enc = int((1.0-args.strength) * args.steps)
 
@@ -758,7 +886,7 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            verbose=True).callback   
+                            verbose=True).callback  
 
     results = []
     with torch.no_grad():
@@ -820,10 +948,35 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                         else:
                             raise Exception(f"Sampler {args.sampler} not recognised.")
 
+                    
                     if return_latent:
                         results.append(samples.clone())
 
                     x_samples = model.decode_first_stage(samples)
+
+                    if args.use_mask and args.overlay_mask:
+                        # Overlay the masked image after the image is generated
+                        if args.init_sample is not None:
+                            img_original = args.init_sample
+                        elif init_image is not None:
+                            img_original = init_image
+                        else:
+                            raise Exception("Cannot overlay the masked image without an init image to overlay")
+
+                        mask_fullres = prepare_mask(args.mask_file if mask_image is None else mask_image, 
+                                                    img_original.shape, 
+                                                    args.mask_contrast_adjust, 
+                                                    args.mask_brightness_adjust)
+                        mask_fullres = mask_fullres[:,:3,:,:]
+                        mask_fullres = repeat(mask_fullres, '1 ... -> b ...', b=batch_size)
+
+                        mask_fullres[mask_fullres < mask_fullres.max()] = 0
+                        mask_fullres = gaussian_filter(mask_fullres, args.mask_overlay_blur)
+                        mask_fullres = torch.Tensor(mask_fullres).to(device)
+
+                        x_samples = img_original * mask_fullres + x_samples * ((mask_fullres * -1.0) + 1)
+
+
                     if return_sample:
                         results.append(x_samples.clone())
 
@@ -962,12 +1115,17 @@ def DeforumAnimArgs():
     #@markdown ####**Motion Parameters:**
     angle = "0:(0)"#@param {type:"string"}
     zoom = "0:(1.04)"#@param {type:"string"}
-    translation_x = "0:(0)"#@param {type:"string"}
+    translation_x = "0:(10*sin(2*3.14*t/10))"#@param {type:"string"}
     translation_y = "0:(0)"#@param {type:"string"}
     translation_z = "0:(10)"#@param {type:"string"}
     rotation_3d_x = "0:(0)"#@param {type:"string"}
     rotation_3d_y = "0:(0)"#@param {type:"string"}
     rotation_3d_z = "0:(0)"#@param {type:"string"}
+    flip_2d_perspective = True #@param {type:"boolean"}
+    perspective_flip_theta = "0:(0)"#@param {type:"string"}
+    perspective_flip_phi = "0:(t%15)"#@param {type:"string"}
+    perspective_flip_gamma = "0:(0)"#@param {type:"string"}
+    perspective_flip_fv = "0:(53)"#@param {type:"string"}
     noise_schedule = "0: (0.02)"#@param {type:"string"}
     strength_schedule = "0: (0.65)"#@param {type:"string"}
     contrast_schedule = "0: (1.0)"#@param {type:"string"}
@@ -989,6 +1147,9 @@ def DeforumAnimArgs():
     #@markdown ####**Video Input:**
     video_init_path ='/content/video_in.mp4'#@param {type:"string"}
     extract_nth_frame = 1#@param {type:"number"}
+    overwrite_extracted_frames = True #@param {type:"boolean"}
+    use_mask_video = False #@param {type:"boolean"}
+    video_mask_path ='/content/video_in.mp4'#@param {type:"string"}
 
     #@markdown ####**Interpolation:**
     interpolate_key_frames = False #@param {type:"boolean"}
@@ -1010,16 +1171,32 @@ class DeformAnimKeys():
         self.rotation_3d_x_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_x), anim_args.max_frames)
         self.rotation_3d_y_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_y), anim_args.max_frames)
         self.rotation_3d_z_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_z), anim_args.max_frames)
+        self.perspective_flip_theta_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_theta), anim_args.max_frames)
+        self.perspective_flip_phi_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_phi), anim_args.max_frames)
+        self.perspective_flip_gamma_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_gamma), anim_args.max_frames)
+        self.perspective_flip_fv_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_fv), anim_args.max_frames)
         self.noise_schedule_series = get_inbetweens(parse_key_frames(anim_args.noise_schedule), anim_args.max_frames)
         self.strength_schedule_series = get_inbetweens(parse_key_frames(anim_args.strength_schedule), anim_args.max_frames)
         self.contrast_schedule_series = get_inbetweens(parse_key_frames(anim_args.contrast_schedule), anim_args.max_frames)
 
 
 def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'):
+    import numexpr
+    import re
+    float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
     key_frame_series = pd.Series([np.nan for a in range(max_frames)])
-
-    for i, value in key_frames.items():
-        key_frame_series[i] = value
+    
+    for i in range(0, max_frames):
+        if i in key_frames:
+            value = key_frames[i]
+            value_is_number = re.match(float_pattern, value)
+            # if it's only a number, leave the rest for the default interpolation
+            if value_is_number:
+                t = i
+                key_frame_series[i] = value
+        if not value_is_number:
+            t = i
+            key_frame_series[i] = numexpr.evaluate(value)
     key_frame_series = key_frame_series.astype(float)
     
     if interp_method == 'Cubic' and len(key_frames.items()) <= 3:
@@ -1036,7 +1213,11 @@ def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'
 
 def parse_key_frames(string, prompt_parser=None):
     import re
-    pattern = r'((?P<frame>[0-9]+):[\s]*[\(](?P<param>[\S\s]*?)[\)])'
+    # because math functions (i.e. sin(t)) can utilize brackets 
+    # it extracts the value in form of some stuff
+    # which has previously been enclosed with brackets and
+    # with a comma or end of line existing after the closing one
+    pattern = r'((?P<frame>[0-9]+):[\s]*\((?P<param>[\S\s]*?)\)([,][\s]?|[\s]?$))'
     frames = dict()
     for match_object in re.finditer(pattern, string):
         frame = int(match_object.groupdict()['frame'])
@@ -1147,8 +1328,10 @@ weights /= weights.sum().abs()
 # !!   "id": "qH74gBWDd2oq",
 # !!   "cellView": "form"
 # !! }}
-def DeforumArgs():
+override_settings_with_file = False #@param {type:"boolean"}
+custom_settings_file = "/content/drive/MyDrive/Settings.txt"#@param {type:"string"}
 
+def DeforumArgs():
     #@markdown **Image Settings**
     W = 512 #@param
     H = 512 #@param
@@ -1169,7 +1352,7 @@ def DeforumArgs():
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
     save_sample_per_step = False #@param {type:"boolean"}
-    show_sample_per_step = True #@param {type:"boolean"}
+    show_sample_per_step = False #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
     n_batch = 1 #@param
@@ -1193,6 +1376,10 @@ def DeforumArgs():
     # Adjust mask image, 1.0 is no adjustment. Should be positive numbers.
     mask_brightness_adjust = 1.0  #@param {type:"number"}
     mask_contrast_adjust = 1.0  #@param {type:"number"}
+    # Overlay the masked image at the end of the generation so it does not get degraded by encoding and decoding
+    overlay_mask = True  #@param {type:"boolean"}
+    # Blur edges of final overlay mask, if used. Minimum = 0 (no blur)
+    mask_overlay_blur = 5 #@param {type:"number"}
 
     #@markdown **Conditioning Settings**
     blue_loss_scale = 0 #@param {type:"number"}
@@ -1465,12 +1652,19 @@ def render_animation(args, anim_args):
         # grab prompt for current frame
         args.prompt = prompt_series[frame_idx]
         print(f"{args.prompt} {args.seed}")
+        if not using_vid_init:
+            print(f"Angle: {keys.angle_series[frame_idx]} Zoom: {keys.zoom_series[frame_idx]}")
+            print(f"Tx: {keys.translation_x_series[frame_idx]} Ty: {keys.translation_y_series[frame_idx]} Tz: {keys.translation_z_series[frame_idx]}")
+            print(f"Rx: {keys.rotation_3d_x_series[frame_idx]} Ry: {keys.rotation_3d_y_series[frame_idx]} Rz: {keys.rotation_3d_z_series[frame_idx]}")
 
         # grab init image for current frame
         if using_vid_init:
-            init_frame = os.path.join(args.outdir, 'inputframes', f"{frame_idx+1:04}.jpg")            
+            init_frame = os.path.join(args.outdir, 'inputframes', f"{frame_idx+1:05}.jpg")            
             print(f"Using video init frame {init_frame}")
             args.init_image = init_frame
+            if anim_args.use_mask_video:
+                mask_frame = os.path.join(args.outdir, 'maskframes', f"{frame_idx+1:05}.jpg")
+                args.mask_file = mask_frame
 
         # sample the diffusion model
         sample, image = generate(args, return_latent=False, return_sample=True)
@@ -1495,6 +1689,29 @@ def render_animation(args, anim_args):
 
         args.seed = next_seed(args)
 
+def vid2frames(video_path, frames_path, n=1, overwrite=True):      
+    if not os.path.exists(frames_path) or overwrite: 
+      try:
+          for f in pathlib.Path(video_in_frame_path).glob('*.jpg'):
+              f.unlink()
+      except:
+          pass
+      assert os.path.exists(video_path), f"Video input {video_path} does not exist"
+          
+      vidcap = cv2.VideoCapture(video_path)
+      success,image = vidcap.read()
+      count = 0
+      t=1
+      success = True
+      while success:
+        if count % n == 0:
+            cv2.imwrite(frames_path + os.path.sep + f"{t:05}.jpg" , image)     # save frame as JPEG file
+            t += 1
+        success,image = vidcap.read()
+        count += 1
+      print("Converted %d frames" % count)
+    else: print("Frames already unpacked")
+
 def render_input_video(args, anim_args):
     # create a folder for the video input frames to live in
     video_in_frame_path = os.path.join(args.outdir, 'inputframes') 
@@ -1502,24 +1719,24 @@ def render_input_video(args, anim_args):
     
     # save the video frames from input video
     print(f"Exporting Video Frames (1 every {anim_args.extract_nth_frame}) frames to {video_in_frame_path}...")
-    try:
-        for f in pathlib.Path(video_in_frame_path).glob('*.jpg'):
-            f.unlink()
-    except:
-        pass
-    vf = r'select=not(mod(n\,'+str(anim_args.extract_nth_frame)+'))'
-    subprocess.run([
-        'ffmpeg', '-i', f'{anim_args.video_init_path}', 
-        '-vf', f'{vf}', '-vsync', 'vfr', '-q:v', '2', 
-        '-loglevel', 'error', '-stats',  
-        os.path.join(video_in_frame_path, '%04d.jpg')
-    ], stdout=subprocess.PIPE).stdout.decode('utf-8')
+    vid2frames(anim_args.video_init_path, video_in_frame_path, anim_args.extract_nth_frame, anim_args.overwrite_extracted_frames)
 
     # determine max frames from length of input frames
     anim_args.max_frames = len([f for f in pathlib.Path(video_in_frame_path).glob('*.jpg')])
-
     args.use_init = True
     print(f"Loading {anim_args.max_frames} input frames from {video_in_frame_path} and saving video frames to {args.outdir}")
+
+    if anim_args.use_mask_video:
+        # create a folder for the mask video input frames to live in
+        mask_in_frame_path = os.path.join(args.outdir, 'maskframes') 
+        os.makedirs(mask_in_frame_path, exist_ok=True)
+
+        # save the video frames from mask video
+        print(f"Exporting Video Frames (1 every {anim_args.extract_nth_frame}) frames to {mask_in_frame_path}...")
+        vid2frames(anim_args.video_mask_path, mask_in_frame_path, anim_args.extract_nth_frame, anim_args.overwrite_extracted_frames)
+        args.use_mask = True
+        args.overlay_mask = True
+
     render_animation(args, anim_args)
 
 def render_interpolation(args, anim_args):
@@ -1623,8 +1840,32 @@ def render_interpolation(args, anim_args):
     args.init_c = None
 
 
-args = SimpleNamespace(**DeforumArgs())
-anim_args = SimpleNamespace(**DeforumAnimArgs())
+args_dict = DeforumArgs()
+anim_args_dict = DeforumAnimArgs()
+
+if override_settings_with_file:
+    print(f"reading custom settings from {custom_settings_file}")
+    if not os.path.isfile(custom_settings_file):
+        print('The custom settings file does not exist. The in-notebook settings will be used instead')
+    else:
+        with open(custom_settings_file, "r") as f:
+            jdata = json.loads(f.read())
+            animation_prompts = jdata["prompts"]
+            for i, k in enumerate(args_dict):
+                if k in jdata:
+                    args_dict[k] = jdata[k]
+                else:
+                    print(f"key {k} doesn't exist in the custom settings data! using the default value of {args_dict[k]}")
+            for i, k in enumerate(anim_args_dict):
+                if k in jdata:
+                    anim_args_dict[k] = jdata[k]
+                else:
+                    print(f"key {k} doesn't exist in the custom settings data! using the default value of {anim_args_dict[k]}")
+            print(args_dict)
+            print(anim_args_dict)
+
+args = SimpleNamespace(**args_dict)
+anim_args = SimpleNamespace(**anim_args_dict)
 
 args.timestring = time.strftime('%Y%m%d%H%M%S')
 args.strength = max(0.0, min(1.0, args.strength))
