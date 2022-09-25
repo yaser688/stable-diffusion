@@ -1940,7 +1940,7 @@ else:
             newest_dir = max(all_step_dirs, key=os.path.getmtime)
             image_path = os.path.join(newest_dir, fname)
             print(image_path)
-            mp4_path = os.path.join(newest_dir, f"{args.timestring}_{args.}_{path_name_modifier}.mp4")
+            mp4_path = os.path.join(newest_dir, f"{args.timestring}_{path_name_modifier}.mp4")
             max_frames = str(args.steps)
         else: # render images for a video
             image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
