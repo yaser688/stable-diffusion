@@ -639,9 +639,10 @@ class SamplerCallback(object):
 
         self.verbose_print = print if verbose else lambda *args, **kwargs: None
 
-    def view_sample_step(self, samples, path_name_modifier=''):
+    def view_sample_step(self, latents, path_name_modifier=''):
+        samples = model.decode_first_stage(latents)
         if self.save_sample_per_step:
-            fname = f'{self.step_index:03}_{path_name_modifier}.png'
+            fname = f'{path_name_modifier}_{self.step_index:05}.png'
             for i, sample in enumerate(samples):
                 sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
                 sample = torch.tensor(np.array(sample))
@@ -681,10 +682,8 @@ class SamplerCallback(object):
             new_img = init_noise * torch.where(is_masked,1,0) + args_dict['x'] * torch.where(is_masked,0,1)
             args_dict['x'].copy_(new_img)
 
-        if self.verbose:
-            # self.view_sample_step(args_dict['denoised'], "x0_pred")
-            # self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
-            self.view_sample_step(simple_decode(args_dict['denoised']), "x0_pred_simpledecode")
+        self.view_sample_step(args_dict['denoised'], "x0_pred")
+        self.view_sample_step(args_dict['x'], "x")
 
     # Callback for Compvis samplers
     # Function that is called on the image (img) and step (i) at each step
@@ -702,9 +701,8 @@ class SamplerCallback(object):
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
 
-        if self.verbose:
-            self.view_sample_step(img, "x0_pred")
-            self.view_sample_step(model.decode_first_stage(img), "x0_pred_sample")
+        self.view_sample_step(pred_x0, "x0_pred")
+        self.view_sample_step(img, "x")
 
 def sample_from_cv2(sample: np.ndarray) -> torch.Tensor:
     sample = ((sample.astype(float) / 255.0) * 2) - 1
@@ -886,7 +884,7 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            verbose=True).callback  
+                            verbose=False).callback  
 
     results = []
     with torch.no_grad():
@@ -1919,8 +1917,7 @@ use_manual_settings = False #@param {type:"boolean"}
 image_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939_%05d.png" #@param {type:"string"}
 mp4_path = "/content/drive/MyDrive/AI/StableDiffu'/content/drive/MyDrive/AI/StableDiffusion/2022-09/sion/2022-09/20220903000939.mp4" #@param {type:"string"}
 render_steps = True  #@param {type: 'boolean'}
-path_name_modifier = "x0_pred" #@param ["x0_pred", "x0_pred_sample", "guided_diff", "x0_pred_orig", "x0_pred_sample_orig"]
-
+path_name_modifier = "x0_pred" #@param ["x0_pred","x"]
 
 if skip_video_for_run_all == True:
     print('Skipping video creation, uncheck skip_video_for_run_all if you want to run it')
@@ -1935,11 +1932,11 @@ else:
         max_frames = "200" #@param {type:"string"}
     else:
         if render_steps: # render steps from a single image
-            fname = f"%03d_{path_name_modifier}.png"
+            fname = f"{path_name_modifier}_%05d.png"
             all_step_dirs = [os.path.join(args.outdir, d) for d in os.listdir(args.outdir) if os.path.isdir(os.path.join(args.outdir,d))]
             newest_dir = max(all_step_dirs, key=os.path.getmtime)
             image_path = os.path.join(newest_dir, fname)
-            print(image_path)
+            print(f"Reading images from {image_path}")
             mp4_path = os.path.join(newest_dir, f"{args.timestring}_{path_name_modifier}.mp4")
             max_frames = str(args.steps)
         else: # render images for a video
