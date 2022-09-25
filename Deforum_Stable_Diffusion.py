@@ -136,6 +136,8 @@ from torchvision.utils import make_grid
 from tqdm import tqdm, trange
 from types import SimpleNamespace
 from torch import autocast
+from sklearn.cluster import KMeans
+from scipy.ndimage import gaussian_filter
 
 sys.path.extend([
     'src/taming-transformers',
@@ -160,6 +162,120 @@ def sanitize(prompt):
     tmp = ''.join(filter(whitelist.__contains__, prompt))
     return tmp.replace(' ', '_')
 
+from functools import reduce
+def construct_RotationMatrixHomogenous(rotation_angles):
+    assert(type(rotation_angles)==list and len(rotation_angles)==3)
+    RH = np.eye(4,4)
+    cv2.Rodrigues(np.array(rotation_angles), RH[0:3, 0:3])
+    return RH
+
+# https://en.wikipedia.org/wiki/Rotation_matrix
+def getRotationMatrixManual(rotation_angles):
+	
+    rotation_angles = [np.deg2rad(x) for x in rotation_angles]
+    
+    phi         = rotation_angles[0] # around x
+    gamma       = rotation_angles[1] # around y
+    theta       = rotation_angles[2] # around z
+    
+    # X rotation
+    Rphi        = np.eye(4,4)
+    sp          = np.sin(phi)
+    cp          = np.cos(phi)
+    Rphi[1,1]   = cp
+    Rphi[2,2]   = Rphi[1,1]
+    Rphi[1,2]   = -sp
+    Rphi[2,1]   = sp
+    
+    # Y rotation
+    Rgamma        = np.eye(4,4)
+    sg            = np.sin(gamma)
+    cg            = np.cos(gamma)
+    Rgamma[0,0]   = cg
+    Rgamma[2,2]   = Rgamma[0,0]
+    Rgamma[0,2]   = sg
+    Rgamma[2,0]   = -sg
+    
+    # Z rotation (in-image-plane)
+    Rtheta      = np.eye(4,4)
+    st          = np.sin(theta)
+    ct          = np.cos(theta)
+    Rtheta[0,0] = ct
+    Rtheta[1,1] = Rtheta[0,0]
+    Rtheta[0,1] = -st
+    Rtheta[1,0] = st
+    
+    R           = reduce(lambda x,y : np.matmul(x,y), [Rphi, Rgamma, Rtheta]) 
+    
+    return R
+
+
+def getPoints_for_PerspectiveTranformEstimation(ptsIn, ptsOut, W, H, sidelength):
+    
+    ptsIn2D      =  ptsIn[0,:]
+    ptsOut2D     =  ptsOut[0,:]
+    ptsOut2Dlist =  []
+    ptsIn2Dlist  =  []
+    
+    for i in range(0,4):
+        ptsOut2Dlist.append([ptsOut2D[i,0], ptsOut2D[i,1]])
+        ptsIn2Dlist.append([ptsIn2D[i,0], ptsIn2D[i,1]])
+    
+    pin  =  np.array(ptsIn2Dlist)   +  [W/2.,H/2.]
+    pout = (np.array(ptsOut2Dlist)  +  [1.,1.]) * (0.5*sidelength)
+    pin  = pin.astype(np.float32)
+    pout = pout.astype(np.float32)
+    
+    return pin, pout
+
+def warpMatrix(W, H, theta, phi, gamma, scale, fV):
+    
+    # M is to be estimated
+    M          = np.eye(4, 4)
+    
+    fVhalf     = np.deg2rad(fV/2.)
+    d          = np.sqrt(W*W+H*H)
+    sideLength = scale*d/np.cos(fVhalf)
+    h          = d/(2.0*np.sin(fVhalf))
+    n          = h-(d/2.0);
+    f          = h+(d/2.0);
+    
+    # Translation along Z-axis by -h
+    T       = np.eye(4,4)
+    T[2,3]  = -h
+    
+    # Rotation matrices around x,y,z
+    R = getRotationMatrixManual([phi, gamma, theta])
+    
+    
+    # Projection Matrix 
+    P       = np.eye(4,4)
+    P[0,0]  = 1.0/np.tan(fVhalf)
+    P[1,1]  = P[0,0]
+    P[2,2]  = -(f+n)/(f-n)
+    P[2,3]  = -(2.0*f*n)/(f-n)
+    P[3,2]  = -1.0
+    
+    # pythonic matrix multiplication
+    F       = reduce(lambda x,y : np.matmul(x,y), [P, T, R]) 
+    
+    # shape should be 1,4,3 for ptsIn and ptsOut since perspectiveTransform() expects data in this way. 
+    # In C++, this can be achieved by Mat ptsIn(1,4,CV_64FC3);
+    ptsIn = np.array([[
+                 [-W/2., H/2., 0.],[ W/2., H/2., 0.],[ W/2.,-H/2., 0.],[-W/2.,-H/2., 0.]
+                 ]])
+    ptsOut  = np.array(np.zeros((ptsIn.shape), dtype=ptsIn.dtype))
+    ptsOut  = cv2.perspectiveTransform(ptsIn, F)
+    
+    ptsInPt2f, ptsOutPt2f = getPoints_for_PerspectiveTranformEstimation(ptsIn, ptsOut, W, H, sideLength)
+    
+    # check float32 otherwise OpenCV throws an error
+    assert(ptsInPt2f.dtype  == np.float32)
+    assert(ptsOutPt2f.dtype == np.float32)
+    M33 = cv2.getPerspectiveTransform(ptsInPt2f,ptsOutPt2f)
+
+    return M33, sideLength
+
 def anim_frame_warp_2d(prev_img_cv2, args, anim_args, keys, frame_idx):
     angle = keys.angle_series[frame_idx]
     zoom = keys.zoom_series[frame_idx]
@@ -171,7 +287,18 @@ def anim_frame_warp_2d(prev_img_cv2, args, anim_args, keys, frame_idx):
     rot_mat = cv2.getRotationMatrix2D(center, angle, zoom)
     trans_mat = np.vstack([trans_mat, [0,0,1]])
     rot_mat = np.vstack([rot_mat, [0,0,1]])
-    xform = np.matmul(rot_mat, trans_mat)
+    if anim_args.flip_2d_perspective:
+        perspective_flip_theta = keys.perspective_flip_theta_series[frame_idx]
+        perspective_flip_phi = keys.perspective_flip_phi_series[frame_idx]
+        perspective_flip_gamma = keys.perspective_flip_gamma_series[frame_idx]
+        perspective_flip_fv = keys.perspective_flip_fv_series[frame_idx]
+        M,sl = warpMatrix(args.W, args.H, perspective_flip_theta, perspective_flip_phi, perspective_flip_gamma, 1., perspective_flip_fv);
+        post_trans_mat = np.float32([[1, 0, (args.W-sl)/2], [0, 1, (args.H-sl)/2]])
+        post_trans_mat = np.vstack([post_trans_mat, [0,0,1]])
+        bM = np.matmul(M, post_trans_mat)
+        xform = np.matmul(bM, rot_mat, trans_mat)
+    else:
+        xform = np.matmul(rot_mat, trans_mat)
 
     return cv2.warpPerspective(
         prev_img_cv2,
@@ -207,7 +334,7 @@ def get_output_folder(output_path, batch_folder):
     os.makedirs(out_path, exist_ok=True)
     return out_path
 
-def load_img(path, shape, use_alpha_as_mask=False):
+def load_img(path, shape=None, use_alpha_as_mask=False):
     # use_alpha_as_mask: Read the alpha channel of the image as the mask image
     if path.startswith('http://') or path.startswith('https://'):
         image = Image.open(requests.get(path, stream=True).raw)
@@ -219,7 +346,8 @@ def load_img(path, shape, use_alpha_as_mask=False):
     else:
         image = image.convert('RGB')
 
-    image = image.resize(shape, resample=Image.LANCZOS)
+    if shape is not None:
+        image = image.resize(shape, resample=Image.LANCZOS)
 
     mask_image = None
     if use_alpha_as_mask:
@@ -313,6 +441,53 @@ def make_mse_loss(target):
     return mse_loss
 
 
+def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None):
+
+    assert n_colors > 0, "Must use at least one color"
+
+    def display_color_palette(color_list):
+        # Expand to 64x64 grid of color pixels
+        images = color_list.unsqueeze(2).repeat(1,1,64).unsqueeze(3).repeat(1,1,1,64)
+        images = images.double().cpu().add(1).div(2).clamp(0, 1)
+        images = torch.tensor(np.array(images))
+        grid = make_grid(images, 8).cpu()
+        display.display(TF.to_pil_image(grid))
+        return
+
+    if ignore_sat_scale is None:
+        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
+    else:
+        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(TF.adjust_saturation(target[0].float(),ignore_sat_scale),1,2).T.cpu().numpy())
+    color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
+    display_color_palette(color_list)
+    print('color_list',color_list)
+    # Get ratio of each color class in the target image
+    color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
+    color_list = color_list[color_indexes]
+    color_ratios = color_counts / torch.sum(torch.Tensor(color_counts))
+    print('color_ratios',color_ratios)
+
+
+    def rgb_color_match_loss(x, sigma, **kwargs):
+        min_color_norm_distances = torch.ones(x.shape).to(device) * 2.0 # difference won't be more than 2 if values are between -1 and 1
+        for color in color_list:
+            color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
+            if ignore_sat_scale is None:
+                color_distances = torch.linalg.norm(x - color,  dim=1)
+            else:
+                color_distances = torch.linalg.norm(TF.adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
+            min_color_norm_distances = torch.minimum(min_color_norm_distances,color_distances)
+
+        # # Get ratio of each color class
+        # # get the class of each
+        # color_classes = ... WIP. Might have to use Wasserstein metric instead for color ratios
+        # color_counts = torch.unique(color_classes, return_counts=True)
+        
+        return min_color_norm_distances.square().mean()
+
+    return rgb_color_match_loss
+
+
 ###
 # Thresholding functions for grad
 ###
@@ -349,18 +524,49 @@ def threshold_by(threshold, threshold_type):
 ###
 # Conditioning helper functions
 ###
+# Decodes the image without passing through the upscaler. The resulting image will be the same size as the latent
+# Thanks to Kevin Turner (https://github.com/keturn) we have a shortcut to look at the decoded image!
+def make_simple_decode(model_name, device='cuda:0'):
+    v1_4_rgb_latent_factors = [
+        #   R       G       B
+        [ 0.298,  0.207,  0.208],  # L1
+        [ 0.187,  0.286,  0.173],  # L2
+        [-0.158,  0.189,  0.264],  # L3
+        [-0.184, -0.271, -0.473],  # L4
+    ]
 
-def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
+    if model_name == "sd-v1-4":
+        rgb_latent_factors = torch.Tensor(v1_4_rgb_latent_factors).to(device)
+    else:
+      raise Exception(f"Model name {model_name} not recognized.")
+
+    def simple_decode(latent):
+        latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
+        latent_image = latent_image.permute(0, 3, 1, 2)
+        return latent_image
+    
+    return simple_decode
+
+
+def make_cond_fn(loss_fn, scale, wrt='x', decode_method=None, verbose=False):
     # Turns a loss function into a cond function that is applied to the decoded RGB sample
     # loss_fn (function): func(x, sigma, denoised) -> number
     # scale (number): how much this loss is applied to the image
     # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
+    # decode_method (str): ['autoencoder','linear'] method to decode the latent to an image
     if wrt is None:
         wrt = 'x'
 
+    if decode_method is None:
+        decode_func = lambda x: x
+    elif decode_method == "autoencoder":
+        decode_func = model.differentiable_decode_first_stage
+    elif decode_method == "linear":
+        decode_func = simple_decode
+
     def cond_fn(x, sigma, denoised, **kwargs):
         with torch.enable_grad():
-            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            denoised_sample = decode_func(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
             grad = -torch.autograd.grad(loss, x)[0]
         verbose_print('Loss:', loss.item())
@@ -368,7 +574,7 @@ def make_cond_fn(loss_fn, scale, wrt='x', verbose=False):
 
     def cond_fn_pred(x, sigma, denoised, **kwargs):
         with torch.enable_grad():
-            denoised_sample = model.differentiable_decode_first_stage(denoised).requires_grad_()
+            denoised_sample = decode_func(denoised).requires_grad_()
             loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
             grad = -torch.autograd.grad(loss, denoised)[0]
         verbose_print('Loss:', loss.item())
@@ -433,9 +639,10 @@ class SamplerCallback(object):
 
         self.verbose_print = print if verbose else lambda *args, **kwargs: None
 
-    def view_sample_step(self, samples, path_name_modifier=''):
+    def view_sample_step(self, latents, path_name_modifier=''):
+        samples = model.decode_first_stage(latents)
         if self.save_sample_per_step:
-            fname = f'{self.step_index:03}_{path_name_modifier}.png'
+            fname = f'{path_name_modifier}_{self.step_index:05}.png'
             for i, sample in enumerate(samples):
                 sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
                 sample = torch.tensor(np.array(sample))
@@ -454,7 +661,7 @@ class SamplerCallback(object):
         return
 
     # The callback function is applied to the image at each step
-    def dynamic_thresholding_(img, threshold):
+    def dynamic_thresholding_(self, img, threshold):
         # Dynamic thresholding from Imagen paper (May 2022)
         s = np.percentile(np.abs(img.cpu()), threshold, axis=tuple(range(1,img.ndim)))
         s = np.max(np.append(s,1.0))
@@ -475,9 +682,8 @@ class SamplerCallback(object):
             new_img = init_noise * torch.where(is_masked,1,0) + args_dict['x'] * torch.where(is_masked,0,1)
             args_dict['x'].copy_(new_img)
 
-        if self.verbose:
-            self.view_sample_step(args_dict['denoised'], "x0_pred")
-            self.view_sample_step(model.decode_first_stage(args_dict['denoised']), "x0_pred_sample")
+        self.view_sample_step(args_dict['denoised'], "x0_pred")
+        self.view_sample_step(args_dict['x'], "x")
 
     # Callback for Compvis samplers
     # Function that is called on the image (img) and step (i) at each step
@@ -495,10 +701,8 @@ class SamplerCallback(object):
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
 
-        if self.verbose:
-            self.view_sample_step(img, "x0_pred")
-            self.view_sample_step(model.decode_first_stage(img), "x0_pred_sample")
-
+        self.view_sample_step(pred_x0, "x0_pred")
+        self.view_sample_step(img, "x")
 
 def sample_from_cv2(sample: np.ndarray) -> torch.Tensor:
     sample = ((sample.astype(float) / 255.0) * 2) - 1
@@ -582,8 +786,8 @@ def spherical_dist_loss(x, y):
     return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
 
 
-def clip_cond_fn(denoised, sigma, **kwargs):
-    clip_in = normalize(make_cutouts(denoised.add(1).div(2)))
+def clip_loss_fn(x, sigma, **kwargs):
+    clip_in = normalize(make_cutouts(x.add(1).div(2)))
     image_embeds = clip_model.encode_image(clip_in).float()
     dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
     dists = dists.view([cutn, 1, -1])
@@ -632,6 +836,7 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
         assert args.use_init, "use_mask==True: use_init is required for a mask"
         assert init_latent is not None, "use_mask==True: An latent init image is required for a mask"
 
+
         mask = prepare_mask(args.mask_file if mask_image is None else mask_image, 
                             init_latent.shape, 
                             args.mask_contrast_adjust, 
@@ -644,6 +849,8 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
         mask = repeat(mask, '1 ... -> b ...', b=batch_size)
     else:
         mask = None
+
+    assert not ( (args.use_mask and args.overlay_mask) and (args.init_sample is None and init_image is None)), "Need an init image when use_mask == True and overlay_mask == True"
         
     t_enc = int((1.0-args.strength) * args.steps)
 
@@ -654,11 +861,19 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
+    if args.colormatch_loss_scale != 0:
+        assert args.colormatch_image is not None, "If using color match loss, colormatch_image is needed"
+        colormatch_image, _ = load_img(args.colormatch_image, shape=(64,64))
+        colormatch_image = colormatch_image.to('cpu')
+        del(_)
+    else:
+        colormatch_image = None
 
     cond_fns = [
-        make_cond_fn(clip_cond_fn, args.clip_loss_scale, wrt=args.gradient_wrt, verbose=False) if args.clip_loss_scale != 0 else None,
-        make_cond_fn(blue_loss_fn, args.blue_loss_scale, verbose=True) if args.blue_loss_scale != 0 else None,
-        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, verbose=True) if args.init_mse_scale != 0 else None,
+        make_cond_fn(clip_loss_fn, args.clip_loss_scale, wrt=args.gradient_wrt, decode_method=args.decode_method, verbose=False) if args.clip_loss_scale != 0 else None,
+        make_cond_fn(blue_loss_fn, args.blue_loss_scale, decode_method=args.decode_method, verbose=True) if args.blue_loss_scale != 0 else None,
+        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, decode_method=args.decode_method, verbose=True) if args.init_mse_scale != 0 else None,
+        make_cond_fn(make_rgb_color_match_loss(colormatch_image, n_colors=args.colormatch_n_colors, ignore_sat_scale=args.ignore_sat_scale), args.colormatch_loss_scale, decode_method=args.decode_method, verbose=True) if args.colormatch_loss_scale != 0 else None,
         ]
 
 
@@ -669,7 +884,7 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            verbose=True).callback   
+                            verbose=False).callback  
 
     results = []
     with torch.no_grad():
@@ -731,10 +946,35 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                         else:
                             raise Exception(f"Sampler {args.sampler} not recognised.")
 
+                    
                     if return_latent:
                         results.append(samples.clone())
 
                     x_samples = model.decode_first_stage(samples)
+
+                    if args.use_mask and args.overlay_mask:
+                        # Overlay the masked image after the image is generated
+                        if args.init_sample is not None:
+                            img_original = args.init_sample
+                        elif init_image is not None:
+                            img_original = init_image
+                        else:
+                            raise Exception("Cannot overlay the masked image without an init image to overlay")
+
+                        mask_fullres = prepare_mask(args.mask_file if mask_image is None else mask_image, 
+                                                    img_original.shape, 
+                                                    args.mask_contrast_adjust, 
+                                                    args.mask_brightness_adjust)
+                        mask_fullres = mask_fullres[:,:3,:,:]
+                        mask_fullres = repeat(mask_fullres, '1 ... -> b ...', b=batch_size)
+
+                        mask_fullres[mask_fullres < mask_fullres.max()] = 0
+                        mask_fullres = gaussian_filter(mask_fullres, args.mask_overlay_blur)
+                        mask_fullres = torch.Tensor(mask_fullres).to(device)
+
+                        x_samples = img_original * mask_fullres + x_samples * ((mask_fullres * -1.0) + 1)
+
+
                     if return_sample:
                         results.append(x_samples.clone())
 
@@ -838,6 +1078,9 @@ if load_on_run_all and ckpt_valid:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
 
+#TODO Get model name information to use linear decoder that is specific for the model
+simple_decode = make_simple_decode(model_checkpoint.split('.')[0], device)
+
 # %%
 # !! {"metadata":{
 # !!   "id": "ov3r4RD1tzsT"
@@ -870,12 +1113,17 @@ def DeforumAnimArgs():
     #@markdown ####**Motion Parameters:**
     angle = "0:(0)"#@param {type:"string"}
     zoom = "0:(1.04)"#@param {type:"string"}
-    translation_x = "0:(0)"#@param {type:"string"}
+    translation_x = "0:(10*sin(2*3.14*t/10))"#@param {type:"string"}
     translation_y = "0:(0)"#@param {type:"string"}
     translation_z = "0:(10)"#@param {type:"string"}
     rotation_3d_x = "0:(0)"#@param {type:"string"}
     rotation_3d_y = "0:(0)"#@param {type:"string"}
     rotation_3d_z = "0:(0)"#@param {type:"string"}
+    flip_2d_perspective = True #@param {type:"boolean"}
+    perspective_flip_theta = "0:(0)"#@param {type:"string"}
+    perspective_flip_phi = "0:(t%15)"#@param {type:"string"}
+    perspective_flip_gamma = "0:(0)"#@param {type:"string"}
+    perspective_flip_fv = "0:(53)"#@param {type:"string"}
     noise_schedule = "0: (0.02)"#@param {type:"string"}
     strength_schedule = "0: (0.65)"#@param {type:"string"}
     contrast_schedule = "0: (1.0)"#@param {type:"string"}
@@ -897,6 +1145,9 @@ def DeforumAnimArgs():
     #@markdown ####**Video Input:**
     video_init_path ='/content/video_in.mp4'#@param {type:"string"}
     extract_nth_frame = 1#@param {type:"number"}
+    overwrite_extracted_frames = True #@param {type:"boolean"}
+    use_mask_video = False #@param {type:"boolean"}
+    video_mask_path ='/content/video_in.mp4'#@param {type:"string"}
 
     #@markdown ####**Interpolation:**
     interpolate_key_frames = False #@param {type:"boolean"}
@@ -918,16 +1169,32 @@ class DeformAnimKeys():
         self.rotation_3d_x_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_x), anim_args.max_frames)
         self.rotation_3d_y_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_y), anim_args.max_frames)
         self.rotation_3d_z_series = get_inbetweens(parse_key_frames(anim_args.rotation_3d_z), anim_args.max_frames)
+        self.perspective_flip_theta_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_theta), anim_args.max_frames)
+        self.perspective_flip_phi_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_phi), anim_args.max_frames)
+        self.perspective_flip_gamma_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_gamma), anim_args.max_frames)
+        self.perspective_flip_fv_series = get_inbetweens(parse_key_frames(anim_args.perspective_flip_fv), anim_args.max_frames)
         self.noise_schedule_series = get_inbetweens(parse_key_frames(anim_args.noise_schedule), anim_args.max_frames)
         self.strength_schedule_series = get_inbetweens(parse_key_frames(anim_args.strength_schedule), anim_args.max_frames)
         self.contrast_schedule_series = get_inbetweens(parse_key_frames(anim_args.contrast_schedule), anim_args.max_frames)
 
 
 def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'):
+    import numexpr
+    import re
+    float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
     key_frame_series = pd.Series([np.nan for a in range(max_frames)])
-
-    for i, value in key_frames.items():
-        key_frame_series[i] = value
+    
+    for i in range(0, max_frames):
+        if i in key_frames:
+            value = key_frames[i]
+            value_is_number = re.match(float_pattern, value)
+            # if it's only a number, leave the rest for the default interpolation
+            if value_is_number:
+                t = i
+                key_frame_series[i] = value
+        if not value_is_number:
+            t = i
+            key_frame_series[i] = numexpr.evaluate(value)
     key_frame_series = key_frame_series.astype(float)
     
     if interp_method == 'Cubic' and len(key_frames.items()) <= 3:
@@ -944,7 +1211,11 @@ def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'
 
 def parse_key_frames(string, prompt_parser=None):
     import re
-    pattern = r'((?P<frame>[0-9]+):[\s]*[\(](?P<param>[\S\s]*?)[\)])'
+    # because math functions (i.e. sin(t)) can utilize brackets 
+    # it extracts the value in form of some stuff
+    # which has previously been enclosed with brackets and
+    # with a comma or end of line existing after the closing one
+    pattern = r'((?P<frame>[0-9]+):[\s]*\((?P<param>[\S\s]*?)\)([,][\s]?|[\s]?$))'
     frames = dict()
     for match_object in re.finditer(pattern, string):
         frame = int(match_object.groupdict()['frame'])
@@ -1008,9 +1279,9 @@ from torch.nn import functional as F
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print('Using device:', device)
 
-clip_name = 'ViT-L/14@336px' #'ViT-B/16' #'ViT-L/14' # 
+clip_name = 'ViT-L/14' # 'ViT-L/14@336px' #'ViT-B/16' #
 clip_model = clip.load(clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
-clip_size = clip_model.visual.input_resolution
+clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
 normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711])
 
@@ -1039,10 +1310,8 @@ for prompt in clip_prompts:
     target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
     weights.append(weight)
 
-if clip_name == 'ViT-L/14@336px':
-  cutout_size = 336
-else:
-  cutout_size = 224
+cutout_size = clip_size
+
 make_cutouts = MakeCutouts(cutout_size, cutn, cut_pow)
 
 target_embeds = torch.cat(target_embeds)
@@ -1057,8 +1326,10 @@ weights /= weights.sum().abs()
 # !!   "id": "qH74gBWDd2oq",
 # !!   "cellView": "form"
 # !! }}
-def DeforumArgs():
+override_settings_with_file = False #@param {type:"boolean"}
+custom_settings_file = "/content/drive/MyDrive/Settings.txt"#@param {type:"string"}
 
+def DeforumArgs():
     #@markdown **Image Settings**
     W = 512 #@param
     H = 512 #@param
@@ -1078,8 +1349,8 @@ def DeforumArgs():
     save_sample_per_step = True #@param {type:"boolean"}
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
-    save_sample_per_step = True #@param {type:"boolean"}
-    show_sample_per_step = True #@param {type:"boolean"}
+    save_sample_per_step = False #@param {type:"boolean"}
+    show_sample_per_step = False #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
     n_batch = 1 #@param
@@ -1103,15 +1374,26 @@ def DeforumArgs():
     # Adjust mask image, 1.0 is no adjustment. Should be positive numbers.
     mask_brightness_adjust = 1.0  #@param {type:"number"}
     mask_contrast_adjust = 1.0  #@param {type:"number"}
+    # Overlay the masked image at the end of the generation so it does not get degraded by encoding and decoding
+    overlay_mask = True  #@param {type:"boolean"}
+    # Blur edges of final overlay mask, if used. Minimum = 0 (no blur)
+    mask_overlay_blur = 5 #@param {type:"number"}
 
     #@markdown **Conditioning Settings**
     blue_loss_scale = 0 #@param {type:"number"}
     init_mse_scale = 0 #@param {type:"number"}
-    clip_loss_scale = 1000 #@param {type:"number"}
-    clamp_grad_threshold = 0.01 #@param {type:"number"}
+    clip_loss_scale = 0 #@param {type:"number"}
+
+    colormatch_loss_scale = 800 #@param {type:"number"}
+    colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
+    colormatch_n_colors = 4 #@param {type:"number"}
+    clamp_grad_threshold = 0.2 #@param {type:"number"}
+    ignore_sat_scale = 5 #@param 
+
     grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
     gradient_wrt = 'x' #@param ["x", "x0_pred"]
     gradient_add_to = 'cond' #@param ["cond", "uncond", "both"]
+    decode_method = 'linear' #@param ["autoencoder","linear"]
 
     #@markdown **Speed vs VRAM Settings**
     cond_uncond_sync = False #@param {type:"boolean"}
@@ -1368,12 +1650,19 @@ def render_animation(args, anim_args):
         # grab prompt for current frame
         args.prompt = prompt_series[frame_idx]
         print(f"{args.prompt} {args.seed}")
+        if not using_vid_init:
+            print(f"Angle: {keys.angle_series[frame_idx]} Zoom: {keys.zoom_series[frame_idx]}")
+            print(f"Tx: {keys.translation_x_series[frame_idx]} Ty: {keys.translation_y_series[frame_idx]} Tz: {keys.translation_z_series[frame_idx]}")
+            print(f"Rx: {keys.rotation_3d_x_series[frame_idx]} Ry: {keys.rotation_3d_y_series[frame_idx]} Rz: {keys.rotation_3d_z_series[frame_idx]}")
 
         # grab init image for current frame
         if using_vid_init:
-            init_frame = os.path.join(args.outdir, 'inputframes', f"{frame_idx+1:04}.jpg")            
+            init_frame = os.path.join(args.outdir, 'inputframes', f"{frame_idx+1:05}.jpg")            
             print(f"Using video init frame {init_frame}")
             args.init_image = init_frame
+            if anim_args.use_mask_video:
+                mask_frame = os.path.join(args.outdir, 'maskframes', f"{frame_idx+1:05}.jpg")
+                args.mask_file = mask_frame
 
         # sample the diffusion model
         sample, image = generate(args, return_latent=False, return_sample=True)
@@ -1398,6 +1687,29 @@ def render_animation(args, anim_args):
 
         args.seed = next_seed(args)
 
+def vid2frames(video_path, frames_path, n=1, overwrite=True):      
+    if not os.path.exists(frames_path) or overwrite: 
+      try:
+          for f in pathlib.Path(video_in_frame_path).glob('*.jpg'):
+              f.unlink()
+      except:
+          pass
+      assert os.path.exists(video_path), f"Video input {video_path} does not exist"
+          
+      vidcap = cv2.VideoCapture(video_path)
+      success,image = vidcap.read()
+      count = 0
+      t=1
+      success = True
+      while success:
+        if count % n == 0:
+            cv2.imwrite(frames_path + os.path.sep + f"{t:05}.jpg" , image)     # save frame as JPEG file
+            t += 1
+        success,image = vidcap.read()
+        count += 1
+      print("Converted %d frames" % count)
+    else: print("Frames already unpacked")
+
 def render_input_video(args, anim_args):
     # create a folder for the video input frames to live in
     video_in_frame_path = os.path.join(args.outdir, 'inputframes') 
@@ -1405,24 +1717,24 @@ def render_input_video(args, anim_args):
     
     # save the video frames from input video
     print(f"Exporting Video Frames (1 every {anim_args.extract_nth_frame}) frames to {video_in_frame_path}...")
-    try:
-        for f in pathlib.Path(video_in_frame_path).glob('*.jpg'):
-            f.unlink()
-    except:
-        pass
-    vf = r'select=not(mod(n\,'+str(anim_args.extract_nth_frame)+'))'
-    subprocess.run([
-        'ffmpeg', '-i', f'{anim_args.video_init_path}', 
-        '-vf', f'{vf}', '-vsync', 'vfr', '-q:v', '2', 
-        '-loglevel', 'error', '-stats',  
-        os.path.join(video_in_frame_path, '%04d.jpg')
-    ], stdout=subprocess.PIPE).stdout.decode('utf-8')
+    vid2frames(anim_args.video_init_path, video_in_frame_path, anim_args.extract_nth_frame, anim_args.overwrite_extracted_frames)
 
     # determine max frames from length of input frames
     anim_args.max_frames = len([f for f in pathlib.Path(video_in_frame_path).glob('*.jpg')])
-
     args.use_init = True
     print(f"Loading {anim_args.max_frames} input frames from {video_in_frame_path} and saving video frames to {args.outdir}")
+
+    if anim_args.use_mask_video:
+        # create a folder for the mask video input frames to live in
+        mask_in_frame_path = os.path.join(args.outdir, 'maskframes') 
+        os.makedirs(mask_in_frame_path, exist_ok=True)
+
+        # save the video frames from mask video
+        print(f"Exporting Video Frames (1 every {anim_args.extract_nth_frame}) frames to {mask_in_frame_path}...")
+        vid2frames(anim_args.video_mask_path, mask_in_frame_path, anim_args.extract_nth_frame, anim_args.overwrite_extracted_frames)
+        args.use_mask = True
+        args.overlay_mask = True
+
     render_animation(args, anim_args)
 
 def render_interpolation(args, anim_args):
@@ -1526,8 +1838,32 @@ def render_interpolation(args, anim_args):
     args.init_c = None
 
 
-args = SimpleNamespace(**DeforumArgs())
-anim_args = SimpleNamespace(**DeforumAnimArgs())
+args_dict = DeforumArgs()
+anim_args_dict = DeforumAnimArgs()
+
+if override_settings_with_file:
+    print(f"reading custom settings from {custom_settings_file}")
+    if not os.path.isfile(custom_settings_file):
+        print('The custom settings file does not exist. The in-notebook settings will be used instead')
+    else:
+        with open(custom_settings_file, "r") as f:
+            jdata = json.loads(f.read())
+            animation_prompts = jdata["prompts"]
+            for i, k in enumerate(args_dict):
+                if k in jdata:
+                    args_dict[k] = jdata[k]
+                else:
+                    print(f"key {k} doesn't exist in the custom settings data! using the default value of {args_dict[k]}")
+            for i, k in enumerate(anim_args_dict):
+                if k in jdata:
+                    anim_args_dict[k] = jdata[k]
+                else:
+                    print(f"key {k} doesn't exist in the custom settings data! using the default value of {anim_args_dict[k]}")
+            print(args_dict)
+            print(anim_args_dict)
+
+args = SimpleNamespace(**args_dict)
+anim_args = SimpleNamespace(**anim_args_dict)
 
 args.timestring = time.strftime('%Y%m%d%H%M%S')
 args.strength = max(0.0, min(1.0, args.strength))
@@ -1581,8 +1917,7 @@ use_manual_settings = False #@param {type:"boolean"}
 image_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939_%05d.png" #@param {type:"string"}
 mp4_path = "/content/drive/MyDrive/AI/StableDiffu'/content/drive/MyDrive/AI/StableDiffusion/2022-09/sion/2022-09/20220903000939.mp4" #@param {type:"string"}
 render_steps = True  #@param {type: 'boolean'}
-path_name_modifier = "x0_pred" #@param ["x0_pred", "x0_pred_sample", "guided_diff", "x0_pred_orig", "x0_pred_sample_orig"]
-
+path_name_modifier = "x0_pred" #@param ["x0_pred","x"]
 
 if skip_video_for_run_all == True:
     print('Skipping video creation, uncheck skip_video_for_run_all if you want to run it')
@@ -1597,12 +1932,12 @@ else:
         max_frames = "200" #@param {type:"string"}
     else:
         if render_steps: # render steps from a single image
-            fname = f"%03d_{path_name_modifier}.png"
+            fname = f"{path_name_modifier}_%05d.png"
             all_step_dirs = [os.path.join(args.outdir, d) for d in os.listdir(args.outdir) if os.path.isdir(os.path.join(args.outdir,d))]
             newest_dir = max(all_step_dirs, key=os.path.getmtime)
             image_path = os.path.join(newest_dir, fname)
-            print(image_path)
-            mp4_path = os.path.join(newest_dir, f"{args.timestring}_{args.}_{path_name_modifier}.mp4")
+            print(f"Reading images from {image_path}")
+            mp4_path = os.path.join(newest_dir, f"{args.timestring}_{path_name_modifier}.mp4")
             max_frames = str(args.steps)
         else: # render images for a video
             image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
