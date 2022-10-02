@@ -3,10 +3,31 @@
 # !!   "id": "c442uQJ_gUgy"
 # !! }}
 """
-# **Deforum Stable Diffusion v0.4**
+# **Deforum Stable Diffusion v0.5**
 [Stable Diffusion](https://github.com/CompVis/stable-diffusion) by Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, Björn Ommer and the [Stability.ai](https://stability.ai/) Team. [K Diffusion](https://github.com/crowsonkb/k-diffusion) by [Katherine Crowson](https://twitter.com/RiversHaveWings). You need to get the ckpt file and put it on your Google Drive first to use this. It can be downloaded from [HuggingFace](https://huggingface.co/CompVis/stable-diffusion).
 
 Notebook by [deforum](https://discord.gg/upmXXsrwZc)
+"""
+
+# %%
+# !! {"metadata":{
+# !!   "id": "LBamKxcmNI7-"
+# !! }}
+"""
+By using this Notebook, you agree to the following Terms of Use, and license:
+
+**Stablity.AI Model Terms of Use**
+
+This model is open access and available to all, with a CreativeML OpenRAIL-M license further specifying rights and usage.
+
+The CreativeML OpenRAIL License specifies:
+
+You can't use the model to deliberately produce nor share illegal or harmful outputs or content
+CompVis claims no rights on the outputs you generate, you are free to use them and are accountable for their use which must not go against the provisions set in the license
+You may re-distribute the weights and use the model commercially and/or as a service. If you do, please be aware you have to include the same use restrictions as the ones in the license and share a copy of the CreativeML OpenRAIL-M to all your users (please read the license entirely and carefully)
+
+
+Please read the full license here: https://huggingface.co/spaces/CompVis/stable-diffusion-license
 """
 
 # %%
@@ -137,6 +158,7 @@ from tqdm import tqdm, trange
 from types import SimpleNamespace
 from torch import autocast
 from sklearn.cluster import KMeans
+import re
 from scipy.ndimage import gaussian_filter
 
 sys.path.extend([
@@ -640,17 +662,18 @@ class SamplerCallback(object):
         self.verbose_print = print if verbose else lambda *args, **kwargs: None
 
     def view_sample_step(self, latents, path_name_modifier=''):
-        samples = model.decode_first_stage(latents)
-        if self.save_sample_per_step:
-            fname = f'{path_name_modifier}_{self.step_index:05}.png'
-            for i, sample in enumerate(samples):
-                sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
-                sample = torch.tensor(np.array(sample))
-                grid = make_grid(sample, 4).cpu()
-                TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
-        if self.show_sample_per_step:
-            print(path_name_modifier)
-            self.display_images(samples)
+        if self.save_sample_per_step or self.show_sample_per_step:
+            samples = model.decode_first_stage(latents)
+            if self.save_sample_per_step:
+                fname = f'{path_name_modifier}_{self.step_index:05}.png'
+                for i, sample in enumerate(samples):
+                    sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
+                    sample = torch.tensor(np.array(sample))
+                    grid = make_grid(sample, 4).cpu()
+                    TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
+            if self.show_sample_per_step:
+                print(path_name_modifier)
+                self.display_images(samples)
         return
 
     def display_images(self, images):
@@ -796,7 +819,131 @@ def clip_loss_fn(x, sigma, **kwargs):
 
 ## CLIP -----------------------------------------
 
-def generate(args, return_latent=False, return_sample=False, return_c=False):
+def check_is_number(value):
+    float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
+    return re.match(float_pattern, value)
+
+# prompt weighting with colons and number coefficients (like 'bacon:0.75 eggs:0.25')
+# borrowed from https://github.com/kylewlacy/stable-diffusion/blob/0a4397094eb6e875f98f9d71193e350d859c4220/ldm/dream/conditioning.py
+# and https://github.com/raefu/stable-diffusion-automatic/blob/unstablediffusion/modules/processing.py
+def get_uc_and_c(prompts, model, args, frame = 0):
+    prompt = prompts[0] # they are the same in a batch anyway
+
+    # get weighted sub-prompts
+    negative_subprompts, positive_subprompts = split_weighted_subprompts(
+        prompt, frame, not args.normalize_prompt_weights
+    )
+
+    uc = get_learned_conditioning(model, negative_subprompts, "", args, -1)
+    c = get_learned_conditioning(model, positive_subprompts, prompt, args, 1)
+
+    return (uc, c)
+
+def get_learned_conditioning(model, weighted_subprompts, text, args, sign = 1):
+    if len(weighted_subprompts) < 1:
+        log_tokenization(text, model, args.log_weighted_subprompts, sign)
+        c = model.get_learned_conditioning(args.n_samples * [text])
+    else:
+        c = None
+        for subtext, subweight in weighted_subprompts:
+            log_tokenization(subtext, model, args.log_weighted_subprompts, sign * subweight)
+            if c is None:
+                c = model.get_learned_conditioning(args.n_samples * [subtext])
+                c *= subweight
+            else:
+                c.add_(model.get_learned_conditioning(args.n_samples * [subtext]), alpha=subweight)
+        
+    return c
+
+def parse_weight(match, frame = 0)->float:
+    import numexpr
+    w_raw = match.group("weight")
+    if w_raw == None:
+        return 1
+    if check_is_number(w_raw):
+        return float(w_raw)
+    else:
+        t = frame
+        if len(w_raw) < 3:
+            print('the value inside `-characters cannot represent a math function')
+            return 1
+        return float(numexpr.evaluate(w_raw[1:-1]))
+
+def normalize_prompt_weights(parsed_prompts):
+    if len(parsed_prompts) == 0:
+        return parsed_prompts
+    weight_sum = sum(map(lambda x: x[1], parsed_prompts))
+    if weight_sum == 0:
+        print(
+            "Warning: Subprompt weights add up to zero. Discarding and using even weights instead.")
+        equal_weight = 1 / max(len(parsed_prompts), 1)
+        return [(x[0], equal_weight) for x in parsed_prompts]
+    return [(x[0], x[1] / weight_sum) for x in parsed_prompts]
+
+def split_weighted_subprompts(text, frame = 0, skip_normalize=False):
+    """
+    grabs all text up to the first occurrence of ':'
+    uses the grabbed text as a sub-prompt, and takes the value following ':' as weight
+    if ':' has no value defined, defaults to 1.0
+    repeats until no text remaining
+    """
+    prompt_parser = re.compile("""
+            (?P<prompt>         # capture group for 'prompt'
+            (?:\\\:|[^:])+      # match one or more non ':' characters or escaped colons '\:'
+            )                   # end 'prompt'
+            (?:                 # non-capture group
+            :+                  # match one or more ':' characters
+            (?P<weight>((        # capture group for 'weight'
+            -?\d+(?:\.\d+)?     # match positive or negative integer or decimal number
+            )|(                 # or
+            `[\S\s]*?`# a math function
+            )))?                 # end weight capture group, make optional
+            \s*                 # strip spaces after weight
+            |                   # OR
+            $                   # else, if no ':' then match end of line
+            )                   # end non-capture group
+            """, re.VERBOSE)
+    negative_prompts = []
+    positive_prompts = []
+    for match in re.finditer(prompt_parser, text):
+        w = parse_weight(match, frame)
+        if w < 0:
+            # negating the sign as we'll feed this to uc
+            negative_prompts.append((match.group("prompt").replace("\\:", ":"), -w))
+        elif w > 0:
+            positive_prompts.append((match.group("prompt").replace("\\:", ":"), w))
+
+    if skip_normalize:
+        return (negative_prompts, positive_prompts)
+    return (normalize_prompt_weights(negative_prompts), normalize_prompt_weights(positive_prompts))
+
+# shows how the prompt is tokenized
+# usually tokens have '</w>' to indicate end-of-word,
+# but for readability it has been replaced with ' '
+def log_tokenization(text, model, log=False, weight=1):
+    if not log:
+        return
+    tokens    = model.cond_stage_model.tokenizer._tokenize(text)
+    tokenized = ""
+    discarded = ""
+    usedTokens = 0
+    totalTokens = len(tokens)
+    for i in range(0, totalTokens):
+        token = tokens[i].replace('</w>', ' ')
+        # alternate color
+        s = (usedTokens % 6) + 1
+        if i < model.cond_stage_model.max_length:
+            tokenized = tokenized + f"\x1b[0;3{s};40m{token}"
+            usedTokens += 1
+        else:  # over max token length
+            discarded = discarded + f"\x1b[0;3{s};40m{token}"
+    print(f"\n>> Tokens ({usedTokens}), Weight ({weight:.2f}):\n{tokenized}\x1b[0m")
+    if discarded != "":
+        print(
+            f">> Tokens Discarded ({totalTokens-usedTokens}):\n{discarded}\x1b[0m"
+        )
+
+def generate(args, frame = 0, return_latent=False, return_sample=False, return_c=False):
     seed_everything(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -891,13 +1038,17 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
         with precision_scope("cuda"):
             with model.ema_scope():
                 for prompts in data:
-                    uc = None
-                    if args.scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
                     if isinstance(prompts, tuple):
                         prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
+                    if args.prompt_weighting:
+                        uc, c = get_uc_and_c(prompts, model, args, frame)
+                    else:
+                        uc = model.get_learned_conditioning(batch_size * [""])
+                        c = model.get_learned_conditioning(prompts)
 
+
+                    if args.scale == 1.0:
+                        uc = None
                     if args.init_c != None:
                         c = args.init_c
 
@@ -997,7 +1148,9 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
 #@markdown **Select and Load Model**
 
 model_config = "v1-inference.yaml" #@param ["custom","v1-inference.yaml"]
-model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt"]
+model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt", "robo-diffusion-v1.ckpt","waifu-diffusion-v1-3.ckpt"]
+if model_checkpoint == "waifu-diffusion-v1-3.ckpt":
+    model_checkpoint = "model-epoch05-float16.ckpt"
 custom_config_path = "" #@param {type:"string"}
 custom_checkpoint_path = "" #@param {type:"string"}
 
@@ -1006,14 +1159,56 @@ half_precision = True # check
 check_sha256 = True #@param {type:"boolean"}
 
 model_map = {
-    "sd-v1-4-full-ema.ckpt": {'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a'},
-    "sd-v1-4.ckpt": {'sha256': 'fe4efff1e174c627256e44ec2991ba279b3816e364b49f9be2abc0b3ff3f8556'},
-    "sd-v1-3-full-ema.ckpt": {'sha256': '54632c6e8a36eecae65e36cb0595fab314e1a1545a65209f24fde221a8d4b2ca'},
-    "sd-v1-3.ckpt": {'sha256': '2cff93af4dcc07c3e03110205988ff98481e86539c51a8098d4f2236e41f7f2f'},
-    "sd-v1-2-full-ema.ckpt": {'sha256': 'bc5086a904d7b9d13d2a7bccf38f089824755be7261c7399d92e555e1e9ac69a'},
-    "sd-v1-2.ckpt": {'sha256': '3b87d30facd5bafca1cbed71cfb86648aad75d1c264663c0cc78c7aea8daec0d'},
-    "sd-v1-1-full-ema.ckpt": {'sha256': 'efdeb5dc418a025d9a8cc0a8617e106c69044bc2925abecc8a254b2910d69829'},
-    "sd-v1-1.ckpt": {'sha256': '86cd1d3ccb044d7ba8db743d717c9bac603c4043508ad2571383f954390f3cea'}
+    "sd-v1-4-full-ema.ckpt": {
+        'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-2-original/blob/main/sd-v1-4-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-4.ckpt": {
+        'sha256': 'fe4efff1e174c627256e44ec2991ba279b3816e364b49f9be2abc0b3ff3f8556',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-3-full-ema.ckpt": {
+        'sha256': '54632c6e8a36eecae65e36cb0595fab314e1a1545a65209f24fde221a8d4b2ca',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-3-original/blob/main/sd-v1-3-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-3.ckpt": {
+        'sha256': '2cff93af4dcc07c3e03110205988ff98481e86539c51a8098d4f2236e41f7f2f',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-3-original/resolve/main/sd-v1-3.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-2-full-ema.ckpt": {
+        'sha256': 'bc5086a904d7b9d13d2a7bccf38f089824755be7261c7399d92e555e1e9ac69a',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-2-original/blob/main/sd-v1-2-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-2.ckpt": {
+        'sha256': '3b87d30facd5bafca1cbed71cfb86648aad75d1c264663c0cc78c7aea8daec0d',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-2-original/resolve/main/sd-v1-2.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-1-full-ema.ckpt": {
+        'sha256': 'efdeb5dc418a025d9a8cc0a8617e106c69044bc2925abecc8a254b2910d69829',
+        'url':'https://huggingface.co/CompVis/stable-diffusion-v-1-1-original/resolve/main/sd-v1-1-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-1.ckpt": {
+        'sha256': '86cd1d3ccb044d7ba8db743d717c9bac603c4043508ad2571383f954390f3cea',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-1-original/resolve/main/sd-v1-1.ckpt',
+        'requires_login': True,
+        },
+    "robo-diffusion-v1.ckpt": {
+        'sha256': '244dbe0dcb55c761bde9c2ac0e9b46cc9705ebfe5f1f3a7cc46251573ea14e16',
+        'url': 'https://huggingface.co/nousr/robo-diffusion/resolve/main/models/robo-diffusion-v1.ckpt',
+        'requires_login': False,
+        },
+    "model-epoch05-float16.ckpt": {
+        'sha256': '26cf2a2e30095926bb9fd9de0c83f47adc0b442dbfdc3d667d43778e8b70bece',
+        'url': 'https://huggingface.co/hakurei/waifu-diffusion-v1-3/resolve/main/model-epoch05-float16.ckpt',
+        'requires_login': False,
+        },
 }
 
 # config path
@@ -1029,6 +1224,37 @@ ckpt_path = custom_checkpoint_path if model_checkpoint == "custom" else os.path.
 ckpt_valid = True
 if os.path.exists(ckpt_path):
     print(f"{ckpt_path} exists")
+elif 'url' in model_map[model_checkpoint]:
+    url = model_map[model_checkpoint]['url']
+
+    # CLI dialogue to authenticate download
+    if model_map[model_checkpoint]['requires_login']:
+        print("This model requires an authentication token")
+        print("Please ensure you have accepted its terms of service before continuing.")
+
+        username = input("What is your huggingface username?:")
+        token = input("What is your huggingface token?:")
+
+        _, path = url.split("https://")
+
+        url = f"https://{username}:{token}@{path}"
+
+    # contact server for model
+    print(f"Attempting to download {model_checkpoint}...this may take a while")
+    ckpt_request = requests.get(url)
+    request_status = ckpt_request.status_code
+
+    # inform user of errors
+    if request_status == 403:
+      raise ConnectionRefusedError("You have not accepted the license for this model.")
+    elif request_status == 404:
+      raise ConnectionError("Could not make contact with server")
+    elif request_status != 200:
+      raise ConnectionError(f"Some other error has ocurred - response code: {request_status}")
+
+    # write to model path
+    with open(os.path.join(models_path, model_checkpoint), 'wb') as model_file:
+        model_file.write(ckpt_request.content)
 else:
     print(f"Please download model checkpoint and place in {os.path.join(models_path, model_checkpoint)}")
     ckpt_valid = False
@@ -1108,7 +1334,7 @@ def DeforumAnimArgs():
     #@markdown ####**Animation:**
     animation_mode = 'None' #@param ['None', '2D', '3D', 'Video Input', 'Interpolation'] {type:'string'}
     max_frames = 1000 #@param {type:"number"}
-    border = 'wrap' #@param ['wrap', 'replicate'] {type:'string'}
+    border = 'replicate' #@param ['wrap', 'replicate'] {type:'string'}
 
     #@markdown ####**Motion Parameters:**
     angle = "0:(0)"#@param {type:"string"}
@@ -1119,7 +1345,7 @@ def DeforumAnimArgs():
     rotation_3d_x = "0:(0)"#@param {type:"string"}
     rotation_3d_y = "0:(0)"#@param {type:"string"}
     rotation_3d_z = "0:(0)"#@param {type:"string"}
-    flip_2d_perspective = True #@param {type:"boolean"}
+    flip_2d_perspective = False #@param {type:"boolean"}
     perspective_flip_theta = "0:(0)"#@param {type:"string"}
     perspective_flip_phi = "0:(t%15)"#@param {type:"string"}
     perspective_flip_gamma = "0:(0)"#@param {type:"string"}
@@ -1180,14 +1406,12 @@ class DeformAnimKeys():
 
 def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'):
     import numexpr
-    import re
-    float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
     key_frame_series = pd.Series([np.nan for a in range(max_frames)])
     
     for i in range(0, max_frames):
         if i in key_frames:
             value = key_frames[i]
-            value_is_number = re.match(float_pattern, value)
+            value_is_number = check_is_number(value)
             # if it's only a number, leave the rest for the default interpolation
             if value_is_number:
                 t = i
@@ -1210,7 +1434,6 @@ def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'
     return key_frame_series
 
 def parse_key_frames(string, prompt_parser=None):
-    import re
     # because math functions (i.e. sin(t)) can utilize brackets 
     # it extracts the value in form of some stuff
     # which has previously been enclosed with brackets and
@@ -1228,7 +1451,6 @@ def parse_key_frames(string, prompt_parser=None):
         raise RuntimeError('Key Frame string not correctly formatted')
     return frames
 
-
 # %%
 # !! {"metadata":{
 # !!   "id": "63UOJvU3xdPS"
@@ -1244,9 +1466,12 @@ def parse_key_frames(string, prompt_parser=None):
 # !! }}
 
 prompts = [
-    "a beautiful forest by Asher Brown Durand, trending on Artstation", #the first prompt I want
-    "a beautiful portrait of a woman by Artgerm, trending on Artstation", #the second prompt I want
-    #"the third prompt I don't want it I commented it with an",
+    "a beautiful forest by Asher Brown Durand, trending on Artstation", # the first prompt I want
+    "a beautiful portrait of a woman by Artgerm, trending on Artstation", # the second prompt I want
+    #"this prompt I don't want it I commented it out",
+    #"a nousr robot, trending on Artstation", # use "nousr robot" with the robot diffusion model (see model_checkpoint setting)
+    #"touhou 1girl komeiji_koishi portrait, green hair", # waifu diffusion prompts can use danbooru tag groups (see model_checkpoint)
+    #"this prompt has weights if prompt weighting enabled:2 can also do negative:-2", # (see prompt_weighting)
 ]
 
 animation_prompts = {
@@ -1326,6 +1551,7 @@ weights /= weights.sum().abs()
 # !!   "id": "qH74gBWDd2oq",
 # !!   "cellView": "form"
 # !! }}
+#@markdown **Load Settings**
 override_settings_with_file = False #@param {type:"boolean"}
 custom_settings_file = "/content/drive/MyDrive/Settings.txt"#@param {type:"string"}
 
@@ -1352,6 +1578,11 @@ def DeforumArgs():
     save_sample_per_step = False #@param {type:"boolean"}
     show_sample_per_step = False #@param {type:"boolean"}
 
+    #@markdown **Prompt Settings**
+    prompt_weighting = False #@param {type:"boolean"}
+    normalize_prompt_weights = True #@param {type:"boolean"}
+    log_weighted_subprompts = False #@param {type:"boolean"}
+
     #@markdown **Batch Settings**
     n_batch = 1 #@param
     batch_name = "StableFun" #@param {type:"string"}
@@ -1375,9 +1606,9 @@ def DeforumArgs():
     mask_brightness_adjust = 1.0  #@param {type:"number"}
     mask_contrast_adjust = 1.0  #@param {type:"number"}
     # Overlay the masked image at the end of the generation so it does not get degraded by encoding and decoding
-    overlay_mask = True  #@param {type:"boolean"}
+    overlay_mask = True  # {type:"boolean"}
     # Blur edges of final overlay mask, if used. Minimum = 0 (no blur)
-    mask_overlay_blur = 5 #@param {type:"number"}
+    mask_overlay_blur = 5 # {type:"number"}
 
     #@markdown **Conditioning Settings**
     blue_loss_scale = 0 #@param {type:"number"}
@@ -1665,7 +1896,7 @@ def render_animation(args, anim_args):
                 args.mask_file = mask_frame
 
         # sample the diffusion model
-        sample, image = generate(args, return_latent=False, return_sample=True)
+        sample, image = generate(args, frame_idx, return_latent=False, return_sample=True)
         if not using_vid_init:
             prev_sample = sample
 
