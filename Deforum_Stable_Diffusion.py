@@ -173,7 +173,7 @@ sys.path.extend([
 
 import py3d_tools as p3d
 
-from helpers import DepthModel, sampler_fn
+from helpers import DepthModel, sampler_fn, CFGDenoiserWithGrad
 from k_diffusion.external import CompVisDenoiser
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -542,13 +542,10 @@ def threshold_by(threshold, threshold_type):
   else:
       raise Exception(f"Thresholding type {threshold_type} not supported")
 
-
-###
-# Conditioning helper functions
-###
+#
 # Decodes the image without passing through the upscaler. The resulting image will be the same size as the latent
 # Thanks to Kevin Turner (https://github.com/keturn) we have a shortcut to look at the decoded image!
-def make_simple_decode(model_name, device='cuda:0'):
+def make_simple_decode(model_version, device='cuda:0'):
     v1_4_rgb_latent_factors = [
         #   R       G       B
         [ 0.298,  0.207,  0.208],  # L1
@@ -557,10 +554,10 @@ def make_simple_decode(model_name, device='cuda:0'):
         [-0.184, -0.271, -0.473],  # L4
     ]
 
-    if model_name == "sd-v1-4":
+    if model_version[:5] == "sd-v1":
         rgb_latent_factors = torch.Tensor(v1_4_rgb_latent_factors).to(device)
     else:
-      raise Exception(f"Model name {model_name} not recognized.")
+    raise Exception(f"Model name {model_version} not recognized.")
 
     def simple_decode(latent):
         latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
@@ -568,48 +565,6 @@ def make_simple_decode(model_name, device='cuda:0'):
         return latent_image
     
     return simple_decode
-
-
-def make_cond_fn(loss_fn, scale, wrt='x', decode_method=None, verbose=False):
-    # Turns a loss function into a cond function that is applied to the decoded RGB sample
-    # loss_fn (function): func(x, sigma, denoised) -> number
-    # scale (number): how much this loss is applied to the image
-    # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
-    # decode_method (str): ['autoencoder','linear'] method to decode the latent to an image
-    if wrt is None:
-        wrt = 'x'
-
-    if decode_method is None:
-        decode_func = lambda x: x
-    elif decode_method == "autoencoder":
-        decode_func = model.differentiable_decode_first_stage
-    elif decode_method == "linear":
-        decode_func = simple_decode
-
-    def cond_fn(x, sigma, denoised, **kwargs):
-        with torch.enable_grad():
-            denoised_sample = decode_func(denoised).requires_grad_()
-            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
-            grad = -torch.autograd.grad(loss, x)[0]
-        verbose_print('Loss:', loss.item())
-        return grad
-
-    def cond_fn_pred(x, sigma, denoised, **kwargs):
-        with torch.enable_grad():
-            denoised_sample = decode_func(denoised).requires_grad_()
-            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
-            grad = -torch.autograd.grad(loss, denoised)[0]
-        verbose_print('Loss:', loss.item())
-        return grad
-
-    verbose_print = print if verbose else lambda *args, **kwargs: None
-    
-    if wrt == 'x':
-        return cond_fn
-    elif wrt == 'x0_pred':
-        return cond_fn_pred
-    else:
-        raise Exception(f"Variable wrt == {wrt} not recognised.")
 
 #
 # Callback functions
@@ -1016,22 +971,40 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
     else:
         colormatch_image = None
 
-    cond_fns = [
-        make_cond_fn(clip_loss_fn, args.clip_loss_scale, wrt=args.gradient_wrt, decode_method=args.decode_method, verbose=False) if args.clip_loss_scale != 0 else None,
-        make_cond_fn(blue_loss_fn, args.blue_loss_scale, decode_method=args.decode_method, verbose=True) if args.blue_loss_scale != 0 else None,
-        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, decode_method=args.decode_method, verbose=True) if args.init_mse_scale != 0 else None,
-        make_cond_fn(make_rgb_color_match_loss(colormatch_image, n_colors=args.colormatch_n_colors, ignore_sat_scale=args.ignore_sat_scale), args.colormatch_loss_scale, decode_method=args.decode_method, verbose=True) if args.colormatch_loss_scale != 0 else None,
-        ]
-
-
-    clamp_func = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+    loss_fns_scales = [
+        [clip_loss_fn,              args.clip_loss_scale],
+        [blue_loss_fn,              args.blue_loss_scale],
+        [make_mse_loss(init_image), args.init_mse_scale],
+        [make_rgb_color_match_loss(colormatch_image, n_colors=args.colormatch_n_colors, ignore_sat_scale=args.ignore_sat_scale), 
+                                    args.colormatch_loss_scale],
+    ]
 
     callback = SamplerCallback(args=args,
                             mask=mask, 
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            verbose=False).callback  
+                            verbose=False).callback 
+
+    clamp_fn = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+
+    model_version = model_checkpoint.split('.')[0] # TODO find a more robust way to get model name
+    simple_decode = make_simple_decode(model_version, device)
+    if args.decode_method is None:
+        decode_fn = lambda x: x
+    elif args.decode_method == "autoencoder":
+        decode_fn = model.differentiable_decode_first_stage
+    elif args.decode_method == "linear":
+        decode_fn = simple_decode
+
+    cfg_model = CFGDenoiserWithGrad(model_wrap, 
+                                    loss_fns_scales, 
+                                    clamp_fn, 
+                                    args.gradient_wrt, 
+                                    args.gradient_add_to, 
+                                    args.cond_uncond_sync,
+                                    decode_fn=decode_fn,
+                                    verbose=True)
 
     results = []
     with torch.no_grad():
@@ -1053,11 +1026,12 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
                         c = args.init_c
 
                     if args.sampler in ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral"]:
+
                         samples = sampler_fn(
                             c=c, 
                             uc=uc, 
                             args=args, 
-                            model_wrap=model_wrap, 
+                            model_wrap=cfg_model, 
                             init_latent=init_latent, 
                             t_enc=t_enc, 
                             cond_fns=cond_fns,
@@ -1067,6 +1041,7 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
                             gradient_add_to=args.gradient_add_to,
                             cond_uncond_sync=args.cond_uncond_sync,
                             cb=callback,
+                            autoencoder_version=model_checkpoint.split('.')[0],
                             verbose=False)
                     else:
                         # args.sampler == 'plms' or args.sampler == 'ddim':
@@ -1303,9 +1278,6 @@ if load_on_run_all and ckpt_valid:
     model = load_model_from_config(local_config, f"{ckpt_path}", half_precision=half_precision)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
-
-#TODO Get model name information to use linear decoder that is specific for the model
-simple_decode = make_simple_decode(model_checkpoint.split('.')[0], device)
 
 # %%
 # !! {"metadata":{
