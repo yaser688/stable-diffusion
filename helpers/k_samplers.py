@@ -10,11 +10,6 @@ def sampler_fn(
     model_wrap: CompVisDenoiser,
     init_latent: Optional[torch.Tensor] = None,
     t_enc: Optional[torch.Tensor] = None,
-    cond_fns: Optional[list] = None,
-    clamp_func: Callable[[Any], None] = None,
-    gradient_wrt: Optional[str] = None,
-    gradient_add_to: Optional[str] = None,
-    cond_uncond_sync: Optional[bool] = True,
     device=torch.device("cpu")
     if not torch.cuda.is_available()
     else torch.device("cuda"),

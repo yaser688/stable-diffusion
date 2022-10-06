@@ -557,7 +557,7 @@ def make_simple_decode(model_version, device='cuda:0'):
     if model_version[:5] == "sd-v1":
         rgb_latent_factors = torch.Tensor(v1_4_rgb_latent_factors).to(device)
     else:
-    raise Exception(f"Model name {model_version} not recognized.")
+        raise Exception(f"Model name {model_version} not recognized.")
 
     def simple_decode(latent):
         latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
@@ -1041,7 +1041,6 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
                             gradient_add_to=args.gradient_add_to,
                             cond_uncond_sync=args.cond_uncond_sync,
                             cb=callback,
-                            autoencoder_version=model_checkpoint.split('.')[0],
                             verbose=False)
                     else:
                         # args.sampler == 'plms' or args.sampler == 'ddim':
