@@ -1,7 +1,7 @@
 from torch import nn
 from k_diffusion import utils as k_utils
 import torch
-# Display functions
+from k_diffusion.external import CompVisDenoiser
 from torchvision.utils import make_grid
 from IPython import display
 from torchvision.transforms.functional import to_pil_image
@@ -18,12 +18,13 @@ class CFGDenoiser(nn.Module):
         uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
         return uncond + (cond - uncond) * cond_scale
 
-class CFGDenoiserWithGrad(nn.Module):
+# class CFGDenoiserWithGrad(nn.Module):
+class CFGDenoiserWithGrad(CompVisDenoiser):
     def __init__(self, model, loss_fns, 
                        clamp_func=None, gradient_wrt=None, gradient_add_to=None, cond_uncond_sync=True, 
                        decode_fn=None,
                        verbose=False):
-        super().__init__()
+        super().__init__(model.inner_model)
         self.inner_model = model
         self.clamp_func = clamp_func # Gradient clamping function, clamp_func(grad, sigma)
         self.gradient_wrt = gradient_wrt # Calculate gradient with respect to ["x", "x0_pred", "both"]
@@ -40,11 +41,6 @@ class CFGDenoiserWithGrad(nn.Module):
                 cond_fn = None
             cond_fns += [cond_fn]
         self.cond_fns = cond_fns
-
-    def __getattr__(self, attr):
-        if attr in self.__dict__:
-            return getattr(self, attr)
-        return getattr(self.inner_model, attr)
 
     def cond_model_fn_(self, x, sigma, **kwargs):
         total_cond_grad = torch.zeros_like(x)
