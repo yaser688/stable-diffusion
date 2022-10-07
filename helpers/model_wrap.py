@@ -19,18 +19,24 @@ class CFGDenoiser(nn.Module):
         return uncond + (cond - uncond) * cond_scale
 
 class CFGDenoiserWithGrad(CompVisDenoiser):
-    def __init__(self, model, loss_fns_scales, 
-                       clamp_func=None, gradient_wrt=None, gradient_add_to=None, cond_uncond_sync=True, 
-                       decode_method=None,
+    def __init__(self, model, 
+                       loss_fns_scales, # list of [cond_function, scale] pairs
+                       clamp_func=None,  # Gradient clamping function, clamp_func(grad, sigma)
+                       gradient_wrt=None, # Calculate gradient with respect to ["x", "x0_pred", "both"]
+                       gradient_add_to=None, # Add gradient to ["cond", "uncond", "both"]
+                       cond_uncond_sync=True, # Calculates the cond and uncond simultaneously
+                       decode_method=None, # function used to decode the latent during gradient calculation
                        verbose=False):
         super().__init__(model.inner_model)
         self.inner_model = model
-        self.clamp_func = clamp_func # Gradient clamping function, clamp_func(grad, sigma)
-        self.gradient_wrt = gradient_wrt # Calculate gradient with respect to ["x", "x0_pred", "both"]
-        self.gradient_add_to = gradient_add_to # Add gradient to ["cond", "uncond", "both"]
-        self.cond_uncond_sync = cond_uncond_sync # Calculates the cond and uncond simultaneously
+        self.cond_uncond_sync = cond_uncond_sync 
 
-        # decode_fn is the function used to decode the latent during gradient calculation
+        # Initialize gradient calculation variables
+        self.clamp_func = clamp_func
+        self.gradient_add_to = gradient_add_to
+        if gradient_wrt is None:
+            self.gradient_wrt = 'x'
+        self.gradient_wrt = gradient_wrt
         if decode_method is None:
             decode_fn = lambda x: x
         elif decode_method == "autoencoder":
@@ -41,27 +47,33 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         self.decode_fn = decode_fn
         self.verbose = verbose
 
+        # Parse loss function-scale pairs
         cond_fns = []
         for loss_fn,scale in loss_fns_scales:
             if scale != 0:
-                cond_fn = self.make_cond_fn(loss_fn, scale, wrt=gradient_wrt, decode_fn=decode_fn, verbose=False)
+                cond_fn = self.make_cond_fn(loss_fn, scale)
             else:
                 cond_fn = None
             cond_fns += [cond_fn]
         self.cond_fns = cond_fns
 
-    def cond_model_fn_(self, x, sigma, **kwargs):
+    # General denoising model with gradient conditioning
+    def cond_model_fn_(self, x, sigma, inner_model=self.inner_model, **kwargs):
         total_cond_grad = torch.zeros_like(x)
         for cond_fn in self.cond_fns:
             if cond_fn is None: continue
+
+            # Gradient with respect to x
             if self.gradient_wrt == 'x':
                 with torch.enable_grad():
                     x = x.detach().requires_grad_()
-                    denoised = self.inner_model(x, sigma, **kwargs)
+                    denoised = inner_model(x, sigma, **kwargs)
                     cond_grad = cond_fn(x, sigma, denoised=denoised, **kwargs).detach()
+            
+            # Gradient wrt x0_pred, so save some compute: don't record grad until after denoised is calculated
             elif self.gradient_wrt == 'x0_pred':
                 with torch.no_grad():
-                    denoised = self.inner_model(x, sigma, **kwargs)
+                    denoised = inner_model(x, sigma, **kwargs)
                 with torch.enable_grad():
                     cond_grad = cond_fn(x, sigma, denoised=denoised.detach().requires_grad_(), **kwargs).detach()
             total_cond_grad += cond_grad
@@ -71,62 +83,79 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         # Clamp the gradient
         total_cond_grad = self.clamp_grad_verbose(total_cond_grad, sigma)
 
+        # Add gradient to the denoised image
         if self.gradient_wrt == 'x':
             x.copy_(x.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim))
             cond_denoised = denoised.detach()
         elif self.gradient_wrt == 'x0_pred':
             cond_denoised = denoised.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim)
 
-        # cond_denoised = denoised.detach() + total_cond_grad * k_utils.append_dims(sigma ** 2, x.ndim)
-
         return cond_denoised
 
-    def cfg_cond_model_fn_(self, x, sigma, uncond, cond, cond_scale, **kwargs):
+    # # CFG-specific denoiser with conditioning
+    # def cfg_cond_model_fn_(self, x, sigma, uncond, cond, cond_scale, **kwargs):
         
+    #     sigma_in = torch.cat([sigma] * 2)
+    #     cond_in = torch.cat([uncond, cond])
+
+    #     total_cond_grad = torch.zeros_like(x)
+    #     for cond_fn in self.cond_fns:
+    #         if cond_fn is None: continue
+
+    #         # Gradient with respect to x
+    #         if self.gradient_wrt == 'x':
+    #             with torch.enable_grad():
+    #                 x = x.detach().requires_grad_()
+    #                 x_in = torch.cat([x] * 2)
+    #                 denoised = self.inner_model(x_in, sigma_in, cond=cond_in, **kwargs)
+    #                 uncond_x0, cond_x0 = denoised.chunk(2)
+    #                 x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
+    #                 cond_grad = cond_fn(x, sigma, denoised=x0_pred, **kwargs).detach()
+            
+    #         # Gradient wrt x0_pred, so save some compute: don't record grad until after denoised is calculated
+    #         elif self.gradient_wrt == 'x0_pred':
+    #             with torch.no_grad():
+    #                 x = torch.cat([x] * 2)
+    #                 denoised = self.inner_model(x, sigma, cond=cond_in, **kwargs)
+    #                 uncond_x0, cond_x0 = denoised.chunk(2)
+    #                 x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
+    #             with torch.enable_grad():
+    #                 cond_grad = cond_fn(x, sigma, denoised=x0_pred.detach().requires_grad_(), **kwargs).detach()
+    #         total_cond_grad += cond_grad
+        
+    #     total_cond_grad = torch.nan_to_num(total_cond_grad, nan=0.0, posinf=float('inf'), neginf=-float('inf'))
+
+    #     total_cond_grad = self.clamp_grad_verbose(total_cond_grad, sigma)
+
+    #     # Add gradient to the denoised image
+    #     if self.gradient_wrt == 'x':
+    #         x.copy_(x.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim))
+    #         x0 = x0_pred.detach()
+    #     elif self.gradient_wrt == 'x0_pred':
+    #         x0 = x0_pred.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim)
+
+    #     return x0
+
+    def cfg_model(x, sigma, cond, **kwargs):
+        x_in = torch.cat([x] * 2)
         sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, cond])
+        # cond_in = torch.cat([uncond, cond])
 
-        total_cond_grad = torch.zeros_like(x)
-        for cond_fn in self.cond_fns:
-            if cond_fn is None: continue
-            if self.gradient_wrt == 'x':
-                with torch.enable_grad():
-                    x = x.detach().requires_grad_()
-                    x_in = torch.cat([x] * 2)
-                    denoised = self.inner_model(x_in, sigma_in, cond=cond_in, **kwargs)
-                    uncond_x0, cond_x0 = denoised.chunk(2)
-                    x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
-                    cond_grad = cond_fn(x, sigma, denoised=x0_pred, **kwargs).detach()
-            elif self.gradient_wrt == 'x0_pred':
-                with torch.no_grad():
-                    x = torch.cat([x] * 2)
-                    denoised = self.inner_model(x, sigma, cond=cond_in, **kwargs)
-                    uncond_x0, cond_x0 = denoised.chunk(2)
-                    x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
-                with torch.enable_grad():
-                    cond_grad = cond_fn(x, sigma, denoised=x0_pred.detach().requires_grad_(), **kwargs).detach()
-            total_cond_grad += cond_grad
-        
-        total_cond_grad = torch.nan_to_num(total_cond_grad, nan=0.0, posinf=float('inf'), neginf=-float('inf'))
-
-        total_cond_grad = self.clamp_grad_verbose(total_cond_grad, sigma)
-
-        if self.gradient_wrt == 'x':
-            x.copy_(x.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim))
-            x0 = x0_pred.detach()
-        elif self.gradient_wrt == 'x0_pred':
-            x0 = x0_pred.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim)
-
-        return x0
+        denoised = self.inner_model(x, sigma, cond=cond, **kwargs)
+        uncond_x0, cond_x0 = denoised.chunk(2)
+        x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
+        return x0_pred
 
     def forward(self, x, sigma, uncond, cond, cond_scale):
         # Conditioning
         if (self.cond_fns is not None and 
             any(cond_fn is not None for cond_fn in self.cond_fns)):
 
-            # Apply the conditioning gradient to both cond and uncond
-            if self.cond_uncond_sync or self.gradient_add_to == "both":
-                x0 = self.cfg_cond_model_fn_(x, sigma, uncond=uncond, cond=cond, cond_scale=cond_scale)
+            # Apply the conditioning gradient to both cond and uncond after they are combined into the diffused image
+            if self.cond_uncond_sync:
+                # x0 = self.cfg_cond_model_fn_(x, sigma, uncond=uncond, cond=cond, cond_scale=cond_scale)
+                cond_in = torch.cat([uncond, cond])
+                x0 = self.cond_model_fn_(x, sigma, cond=cond_in, inner_model=self.cfg_model)
 
             # Calculate cond and uncond separately
             else:
@@ -138,11 +167,16 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
                     uncond = self.inner_model(x, sigma, cond=uncond)
                     cond = self.cond_model_fn_(x, sigma, cond=cond)
                     x0 = uncond + (cond - uncond) * cond_scale
+                elif self.gradient_add_to == "both":
+                    uncond = self.cond_model_fn_(x, sigma, cond=uncond)
+                    cond = self.cond_model_fn_(x, sigma, cond=cond)
+                    x0 = uncond + (cond - uncond) * cond_scale
                 else: 
                     raise Exception(f"Unrecognised option for gradient_add_to: {self.gradient_add_to}")
 
         # No conditioning
         else:
+            # calculate cond and uncond simultaneously
             if self.cond_uncond_sync:
                 x_in = torch.cat([x] * 2)
                 sigma_in = torch.cat([sigma] * 2)
@@ -156,29 +190,26 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
 
         return x0
 
-    def make_cond_fn(self, loss_fn, scale, wrt='x', decode_fn=None, verbose=False):
+    def make_cond_fn(self, loss_fn, scale):
         # Turns a loss function into a cond function that is applied to the decoded RGB sample
         # loss_fn (function): func(x, sigma, denoised) -> number
         # scale (number): how much this loss is applied to the image
-        # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
-        # decode_fn (callable): method to decode the latent to an image
-        if wrt is None:
-            wrt = 'x'
-
         if decode_fn is None:
             decode_fn = lambda x: x
 
+        # Cond function with respect to x
         def cond_fn(x, sigma, denoised, **kwargs):
             with torch.enable_grad():
-                denoised_sample = decode_fn(denoised).requires_grad_()
+                denoised_sample = self.decode_fn(denoised).requires_grad_()
                 loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
                 grad = -torch.autograd.grad(loss, x)[0]
             verbose_print('Loss:', loss.item())
             return grad
 
+        # Cond function with respect to x0_pred
         def cond_fn_pred(x, sigma, denoised, **kwargs):
             with torch.enable_grad():
-                denoised_sample = decode_fn(denoised).requires_grad_()
+                denoised_sample = self.decode_fn(denoised).requires_grad_()
                 loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
                 grad = -torch.autograd.grad(loss, denoised)[0]
             verbose_print('Loss:', loss.item())
@@ -186,12 +217,12 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
 
         verbose_print = print if verbose else lambda *args, **kwargs: None
         
-        if wrt == 'x':
+        if self.gradient_wrt == 'x':
             return cond_fn
-        elif wrt == 'x0_pred':
+        elif self.gradient_wrt == 'x0_pred':
             return cond_fn_pred
         else:
-            raise Exception(f"Variable wrt == {wrt} not recognised.")
+            raise Exception(f"Variable gradient_wrt == {self.gradient_wrt} not recognised.")
 
     def clamp_grad_verbose(self, grad, sigma):
         if self.clamp_func is not None:
