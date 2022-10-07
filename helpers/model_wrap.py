@@ -136,17 +136,17 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
 
     #     return x0
 
-    def cfg_model(x, sigma, cond, **kwargs):
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
-        # cond_in = torch.cat([uncond, cond])
-
-        denoised = self.inner_model(x, sigma, cond=cond, **kwargs)
-        uncond_x0, cond_x0 = denoised.chunk(2)
-        x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
-        return x0_pred
-
     def forward(self, x, sigma, uncond, cond, cond_scale):
+        def cfg_model(self, x, sigma, cond, **kwargs):
+            x_in = torch.cat([x] * 2)
+            sigma_in = torch.cat([sigma] * 2)
+            # cond_in = torch.cat([uncond, cond])
+
+            denoised = self.inner_model(x, sigma, cond=cond, **kwargs)
+            uncond_x0, cond_x0 = denoised.chunk(2)
+            x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
+            return x0_pred
+
         # Conditioning
         if (self.cond_fns is not None and 
             any(cond_fn is not None for cond_fn in self.cond_fns)):
@@ -155,7 +155,7 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
             if self.cond_uncond_sync:
                 # x0 = self.cfg_cond_model_fn_(x, sigma, uncond=uncond, cond=cond, cond_scale=cond_scale)
                 cond_in = torch.cat([uncond, cond])
-                x0 = self.cond_model_fn_(x, sigma, cond=cond_in, inner_model=self.cfg_model)
+                x0 = self.cond_model_fn_(x, sigma, cond=cond_in, inner_model=cfg_model)
 
             # Calculate cond and uncond separately
             else:
