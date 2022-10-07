@@ -948,11 +948,14 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
     else:
         colormatch_image = None
 
-
+    # Loss functions
     mse_loss_fn = make_mse_loss(init_image)
-    color_loss_fn = make_rgb_color_match_loss(colormatch_image, 
-                                              n_colors=args.colormatch_n_colors, 
-                                              ignore_sat_scale=args.ignore_sat_scale)
+    if args.colormatch_loss_scale != 0:
+        color_loss_fn = make_rgb_color_match_loss(colormatch_image, 
+                                                  n_colors=args.colormatch_n_colors, 
+                                                  ignore_sat_scale=args.ignore_sat_scale)
+    else:
+        color_loss_fn = None
 
     loss_fns_scales = [
         [clip_loss_fn,              args.clip_loss_scale],
@@ -977,7 +980,7 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
                                     args.gradient_add_to, 
                                     args.cond_uncond_sync,
                                     decode_method=args.decode_method,
-                                    verbose=True)
+                                    verbose=False)
 
     results = []
     with torch.no_grad():
@@ -1007,12 +1010,7 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
                             model_wrap=cfg_model, 
                             init_latent=init_latent, 
                             t_enc=t_enc, 
-                            cond_fns=cond_fns,
-                            clamp_func=clamp_func,
                             device=device, 
-                            gradient_wrt=args.gradient_wrt,
-                            gradient_add_to=args.gradient_add_to,
-                            cond_uncond_sync=args.cond_uncond_sync,
                             cb=callback,
                             verbose=False)
                     else:
@@ -1248,7 +1246,7 @@ def load_model_from_config(config, ckpt, verbose=False, device='cuda', half_prec
 #
 # Decodes the image without passing through the upscaler. The resulting image will be the same size as the latent
 # Thanks to Kevin Turner (https://github.com/keturn) we have a shortcut to look at the decoded image!
-def make_simple_decode(model_version, device='cuda:0'):
+def make_linear_decode(model_version, device='cuda:0'):
     v1_4_rgb_latent_factors = [
         #   R       G       B
         [ 0.298,  0.207,  0.208],  # L1
@@ -1262,21 +1260,20 @@ def make_simple_decode(model_version, device='cuda:0'):
     else:
         raise Exception(f"Model name {model_version} not recognized.")
 
-    def simple_decode(latent):
+    def linear_decode(latent):
         latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
         latent_image = latent_image.permute(0, 3, 1, 2)
         return latent_image
     
-    return simple_decode
+    return linear_decode
 
 if load_on_run_all and ckpt_valid:
     local_config = OmegaConf.load(f"{ckpt_config_path}")
     model = load_model_from_config(local_config, f"{ckpt_path}", half_precision=half_precision)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
-    model.autoencoder_linear_decode_mat =  # for sd-v1 autoencoder #TODO this will change with new models
     autoencoder_version = "sd-v1" #TODO this will be different for different models
-    model.simple_decode = make_simple_decode(autoencoder_version, device)
+    model.linear_decode = make_linear_decode(autoencoder_version, device)
 
 
 # %%

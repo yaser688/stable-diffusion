@@ -31,12 +31,12 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         self.cond_uncond_sync = cond_uncond_sync # Calculates the cond and uncond simultaneously
 
         # decode_fn is the function used to decode the latent during gradient calculation
-        if args.decode_method is None:
+        if decode_method is None:
             decode_fn = lambda x: x
-        elif args.decode_method == "autoencoder":
+        elif decode_method == "autoencoder":
             decode_fn = model.inner_model.differentiable_decode_first_stage
-        elif args.decode_method == "linear":
-            decode_fn = model.inner_model.simple_decode
+        elif decode_method == "linear":
+            decode_fn = model.inner_model.linear_decode
 
         self.decode_fn = decode_fn
         self.verbose = verbose
@@ -81,7 +81,7 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
 
         return cond_denoised
 
-    def cfg_cond_model_fn_(self, x_in, sigma, cond, cond_scale, **kwargs):
+    def cfg_cond_model_fn_(self, x, sigma, uncond, cond, cond_scale, **kwargs):
         
         sigma_in = torch.cat([sigma] * 2)
         cond_in = torch.cat([uncond, cond])
@@ -91,16 +91,16 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
             if cond_fn is None: continue
             if self.gradient_wrt == 'x':
                 with torch.enable_grad():
-                    x = x_in.detach().requires_grad_()
-                    x = torch.cat([x] * 2)
-                    denoised = self.inner_model(x, sigma, cond=cond, **kwargs)
+                    x = x.detach().requires_grad_()
+                    x_in = torch.cat([x] * 2)
+                    denoised = self.inner_model(x_in, sigma_in, cond=cond_in, **kwargs)
                     uncond_x0, cond_x0 = denoised.chunk(2)
                     x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
                     cond_grad = cond_fn(x, sigma, denoised=x0_pred, **kwargs).detach()
             elif self.gradient_wrt == 'x0_pred':
                 with torch.no_grad():
                     x = torch.cat([x] * 2)
-                    denoised = self.inner_model(x, sigma, **kwargs)
+                    denoised = self.inner_model(x, sigma, cond=cond_in, **kwargs)
                     uncond_x0, cond_x0 = denoised.chunk(2)
                     x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
                 with torch.enable_grad():
@@ -126,7 +126,7 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
 
             # Apply the conditioning gradient to both cond and uncond
             if self.cond_uncond_sync or self.gradient_add_to == "both":
-                x0 = self.cfg_cond_model_fn(x, sigma, cond=cond, cond_scale=cond_scale)
+                x0 = self.cfg_cond_model_fn_(x, sigma, uncond=uncond, cond=cond, cond_scale=cond_scale)
 
             # Calculate cond and uncond separately
             else:
