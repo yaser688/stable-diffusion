@@ -18,11 +18,10 @@ class CFGDenoiser(nn.Module):
         uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
         return uncond + (cond - uncond) * cond_scale
 
-# class CFGDenoiserWithGrad(nn.Module):
 class CFGDenoiserWithGrad(CompVisDenoiser):
-    def __init__(self, model, loss_fns, 
+    def __init__(self, model, loss_fns_scales, 
                        clamp_func=None, gradient_wrt=None, gradient_add_to=None, cond_uncond_sync=True, 
-                       decode_fn=None,
+                       decode_method=None,
                        verbose=False):
         super().__init__(model.inner_model)
         self.inner_model = model
@@ -30,11 +29,20 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         self.gradient_wrt = gradient_wrt # Calculate gradient with respect to ["x", "x0_pred", "both"]
         self.gradient_add_to = gradient_add_to # Add gradient to ["cond", "uncond", "both"]
         self.cond_uncond_sync = cond_uncond_sync # Calculates the cond and uncond simultaneously
+
+        # decode_fn is the function used to decode the latent during gradient calculation
+        if args.decode_method is None:
+            decode_fn = lambda x: x
+        elif args.decode_method == "autoencoder":
+            decode_fn = model.inner_model.differentiable_decode_first_stage
+        elif args.decode_method == "linear":
+            decode_fn = model.inner_model.simple_decode
+
         self.decode_fn = decode_fn
         self.verbose = verbose
 
         cond_fns = []
-        for loss_fn,scale in loss_fns:
+        for loss_fn,scale in loss_fns_scales:
             if scale != 0:
                 cond_fn = self.make_cond_fn(loss_fn, scale, wrt=gradient_wrt, decode_fn=decode_fn, verbose=False)
             else:
