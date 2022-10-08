@@ -58,7 +58,9 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         self.cond_fns = cond_fns
 
     # General denoising model with gradient conditioning
-    def cond_model_fn_(self, x, sigma, inner_model=self.inner_model, **kwargs):
+    def cond_model_fn_(self, x, sigma, inner_model=None, **kwargs):
+        if inner_model is None:
+            inner_model = self.inner_model
         total_cond_grad = torch.zeros_like(x)
         for cond_fn in self.cond_fns:
             if cond_fn is None: continue
@@ -137,12 +139,12 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
     #     return x0
 
     def forward(self, x, sigma, uncond, cond, cond_scale):
-        def cfg_model(self, x, sigma, cond, **kwargs):
+        def cfg_model(x, sigma, cond, **kwargs):
             x_in = torch.cat([x] * 2)
             sigma_in = torch.cat([sigma] * 2)
             # cond_in = torch.cat([uncond, cond])
 
-            denoised = self.inner_model(x, sigma, cond=cond, **kwargs)
+            denoised = self.inner_model(x_in, sigma_in, cond=cond, **kwargs)
             uncond_x0, cond_x0 = denoised.chunk(2)
             x0_pred = uncond_x0 + (cond_x0 - uncond_x0) * cond_scale
             return x0_pred
@@ -194,8 +196,6 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         # Turns a loss function into a cond function that is applied to the decoded RGB sample
         # loss_fn (function): func(x, sigma, denoised) -> number
         # scale (number): how much this loss is applied to the image
-        if decode_fn is None:
-            decode_fn = lambda x: x
 
         # Cond function with respect to x
         def cond_fn(x, sigma, denoised, **kwargs):
@@ -215,7 +215,7 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
             verbose_print('Loss:', loss.item())
             return grad
 
-        verbose_print = print if verbose else lambda *args, **kwargs: None
+        verbose_print = print if self.verbose else lambda *args, **kwargs: None
         
         if self.gradient_wrt == 'x':
             return cond_fn
