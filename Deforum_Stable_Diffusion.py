@@ -463,9 +463,13 @@ def make_mse_loss(target):
     return mse_loss
 
 
-def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None):
-
-    assert n_colors > 0, "Must use at least one color"
+def make_rgb_color_match_loss(target, n_colors, keep_ratios=True, ignore_sat_scale=None, device='cuda:0'):
+    """
+    target (tensor): Image sample (values from -1 to 1) to extract the color palette
+    n_colors (int): Number of colors in the color palette
+    ignore_sat_scale (None or number>0): Scale to ignore color saturation in color comparison
+    """
+    assert n_colors > 0, "Must use at least one color with color match loss"
 
     def display_color_palette(color_list):
         # Expand to 64x64 grid of color pixels
@@ -476,38 +480,80 @@ def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None):
         display.display(TF.to_pil_image(grid))
         return
 
-    if ignore_sat_scale is None:
-        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
-    else:
-        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(TF.adjust_saturation(target[0].float(),ignore_sat_scale),1,2).T.cpu().numpy())
+    def blend(img1, img2, ratio):
+        return (ratio * img1 + (1.0 - ratio) * img2).clamp(-1, 1).to(img1.dtype)
+
+    def adjust_saturation(sample, saturation_factor):
+        # as in torchvision.transforms.functional.adjust_saturation, but for tensors with values from -1,1
+        # TF.adjust_saturation(sample.add(1).div(2).clamp(0, 1), saturation_factor)   
+
+        return blend(sample, TF.rgb_to_grayscale(sample), saturation_factor)
+
+    # Create color palette
+    kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
     color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
     display_color_palette(color_list)
-    print('color_list',color_list)
     # Get ratio of each color class in the target image
     color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
+    # Order color list from least common to most common (not really necessary)
+    color_counts, color_indexes = zip(*sorted(zip(color_counts, color_indexes)))
     color_list = color_list[color_indexes]
-    color_ratios = color_counts / torch.sum(torch.Tensor(color_counts))
-    print('color_ratios',color_ratios)
-
 
     def rgb_color_match_loss(x, sigma, **kwargs):
-        min_color_norm_distances = torch.ones(x.shape).to(device) * 2.0 # difference won't be more than 2 if values are between -1 and 1
+        min_color_norm_distances = torch.ones(x.shape[0], x.shape[2], x.shape[3]).to(device) * 6.0 # distance to color won't be more than max norm1 distance between -1 and 1 in 3 color dimensions
         for color in color_list:
+            # Make a tensor of entirely one color
             color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
+            # Get the color distances
             if ignore_sat_scale is None:
                 color_distances = torch.linalg.norm(x - color,  dim=1)
             else:
-                color_distances = torch.linalg.norm(TF.adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
+                color_distances = torch.linalg.norm(adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
+
             min_color_norm_distances = torch.minimum(min_color_norm_distances,color_distances)
 
-        # # Get ratio of each color class
-        # # get the class of each
-        # color_classes = ... WIP. Might have to use Wasserstein metric instead for color ratios
-        # color_counts = torch.unique(color_classes, return_counts=True)
-        
         return min_color_norm_distances.square().mean()
 
-    return rgb_color_match_loss
+    def rgb_color_ratio_loss(x, sigma, **kwargs):
+        all_color_norm_distances = torch.ones(len(color_list), x.shape[0], x.shape[2], x.shape[3]).to(device) * 6.0 # distance to color won't be more than max norm1 distance between -1 and 1 in 3 color dimensions
+
+        for ic,color in enumerate(color_list):
+            # Make a tensor of entirely one color
+            color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
+            # Get the color distances
+            if ignore_sat_scale is None or ignore_sat_scale == 0:
+                # Simple color distance
+                color_distances = torch.linalg.norm(x - color,  dim=1)
+            else:
+                # Color distance if the colors were saturated
+                # This is to make color comparison ignore shadows and highlights, for example
+                color_distances = torch.linalg.norm(adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
+
+            all_color_norm_distances[ic] = color_distances
+        all_color_norm_distances = torch.flatten(all_color_norm_distances,start_dim=2)
+
+        # Get the target color distances
+        color_distribution = torch.zeros(all_color_norm_distances.shape, device=device)
+        for i_image in range(all_color_norm_distances.shape[1]):
+            for ic,color0 in enumerate(color_list):
+                i_dist = 0
+                for jc,color1 in enumerate(color_list):
+                    color_dist = torch.linalg.norm(color0 - color1)
+                    color_distribution[ic,i_image,i_dist:i_dist+color_counts[jc]] = color_dist
+                    i_dist += color_counts[jc]
+
+        # Sort the color distances so we can compare them as if they were a cumulative distribution function
+        color_distribution, _ = torch.sort(color_distribution,dim=2)
+        all_color_norm_distances, _ = torch.sort(all_color_norm_distances,dim=2)
+        
+        color_norm_distribution_diff = all_color_norm_distances - color_distribution
+
+        return color_norm_distribution_diff.square().mean()
+        
+    if keep_ratios:
+        return rgb_color_match_loss
+    else:
+        return rgb_color_ratio_loss
 
 
 ###
@@ -594,18 +640,18 @@ class SamplerCallback(object):
         self.verbose_print = print if verbose else lambda *args, **kwargs: None
 
     def view_sample_step(self, latents, path_name_modifier=''):
-        if self.save_sample_per_step or self.show_sample_per_step:
+        if self.save_sample_per_step:
             samples = model.decode_first_stage(latents)
-            if self.save_sample_per_step:
-                fname = f'{path_name_modifier}_{self.step_index:05}.png'
-                for i, sample in enumerate(samples):
-                    sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
-                    sample = torch.tensor(np.array(sample))
-                    grid = make_grid(sample, 4).cpu()
-                    TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
-            if self.show_sample_per_step:
-                print(path_name_modifier)
-                self.display_images(samples)
+            fname = f'{path_name_modifier}_{self.step_index:05}.png'
+            for i, sample in enumerate(samples):
+                sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
+                sample = torch.tensor(np.array(sample))
+                grid = make_grid(sample, 4).cpu()
+                TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
+        if self.show_sample_per_step:
+            samples = model.linear_decode(latents)
+            print(path_name_modifier)
+            self.display_images(samples)
         return
 
     def display_images(self, images):
@@ -749,7 +795,7 @@ def clip_loss_fn(x, sigma, **kwargs):
     losses = dists.mul(weights).sum(2).mean(0)
     return losses.sum()
 
-## CLIP -----------------------------------------
+## end CLIP -----------------------------------------
 
 def check_is_number(value):
     float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
@@ -1541,7 +1587,6 @@ def DeforumArgs():
 
     #@markdown **Save & Display Settings**
     save_samples = True #@param {type:"boolean"}
-    save_sample_per_step = True #@param {type:"boolean"}
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
     save_sample_per_step = False #@param {type:"boolean"}
