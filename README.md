@@ -15,7 +15,7 @@ install anaconda for managing python environments and packages https://www.anaco
 
 create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
 
-open a conda powershell (on Windows)
+open a conda powershell (on Windows) or terminal (Linux)
 
 
 ## Getting Started
