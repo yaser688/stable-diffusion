@@ -11,11 +11,9 @@
 </p>
 
 ## Before Starting
-install anaconda for managing python environments and packages https://www.anaconda.com/
-
-create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
-
-open a conda powershell (on Windows) or terminal (Linux)
+1. install anaconda for managing python environments and packages https://www.anaconda.com/
+2. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
+3. open a conda powershell (on Windows) or terminal (Linux)
 
 
 ## Getting Started
