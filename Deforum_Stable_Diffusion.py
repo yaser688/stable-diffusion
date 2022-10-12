@@ -1621,7 +1621,7 @@ def DeforumArgs():
     mask_overlay_blur = 5 # {type:"number"}
 
     #@markdown **Conditioning Settings**
-    blue_loss_scale = 0 #@param {type:"number"}
+    blue_loss_scale = 0
     init_mse_scale = 0 #@param {type:"number"}
     clip_loss_scale = 0 #@param {type:"number"}
     clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16']
