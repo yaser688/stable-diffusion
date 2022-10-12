@@ -1829,6 +1829,7 @@ image_path = "/content/drive/MyDrive/AI/StableDiffusion/2022-09/20220903000939_%
 mp4_path = "/content/drive/MyDrive/AI/StableDiffu'/content/drive/MyDrive/AI/StableDiffusion/2022-09/sion/2022-09/20220903000939.mp4" #@param {type:"string"}
 render_steps = True  #@param {type: 'boolean'}
 path_name_modifier = "x0_pred" #@param ["x0_pred","x"]
+make_gif = False  # @param {type: 'boolean'}
 
 
 if skip_video_for_run_all == True:
@@ -1854,6 +1855,7 @@ else:
         else: # render images for a video
             image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
             mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
+            gif_path = os.path.join(args.outdir, f"{args.timestring}.gif")
             max_frames = str(anim_args.max_frames)
 
     # make video
@@ -1883,6 +1885,16 @@ else:
     mp4 = open(mp4_path,'rb').read()
     data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
     display.display( display.HTML(f'<video controls loop><source src="{data_url}" type="video/mp4"></video>') )
+    j
+    if make_gif:
+        cmd_gif = [
+            'ffmpeg',
+            '-y',
+            '-i', mp4_path,
+            '-r', str(fps),
+            gif_path
+        ]
+        process_gif = subprocess.Popen(cmd_gif, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 # %%
 # !! {"main_metadata":{
