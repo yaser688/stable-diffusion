@@ -17,26 +17,25 @@
 
 
 ## Getting Started
-clone the github repository:
+4. clone the github repository:
 ```
 git clone -b local https://github.com/deforum/stable-diffusion.git
 cd stable-diffusion
 
 ```
-create anaconda environment:
+5. create anaconda environment:
 ```
 conda create -n dsd python=3.9 -y
 conda activate dsd
 conda install pytorch cudatoolkit=11.6 torchvision torchaudio -c pytorch -c conda-forge -y
 
 ```
-install required packages:
+6. install required packages:
 ```
 python -m pip install -r requirements.txt
 
 ```
-
-check your installation by running the .py
+7.check your installation by running the .py
 ```
 python Deforum_Stable_Diffusion.py
 
