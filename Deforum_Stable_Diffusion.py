@@ -3,10 +3,31 @@
 # !!   "id": "c442uQJ_gUgy"
 # !! }}
 """
-# **Deforum Stable Diffusion v0.4**
+# **Deforum Stable Diffusion v0.5**
 [Stable Diffusion](https://github.com/CompVis/stable-diffusion) by Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, Björn Ommer and the [Stability.ai](https://stability.ai/) Team. [K Diffusion](https://github.com/crowsonkb/k-diffusion) by [Katherine Crowson](https://twitter.com/RiversHaveWings). You need to get the ckpt file and put it on your Google Drive first to use this. It can be downloaded from [HuggingFace](https://huggingface.co/CompVis/stable-diffusion).
 
 Notebook by [deforum](https://discord.gg/upmXXsrwZc)
+"""
+
+# %%
+# !! {"metadata":{
+# !!   "id": "LBamKxcmNI7-"
+# !! }}
+"""
+By using this Notebook, you agree to the following Terms of Use, and license:
+
+**Stablity.AI Model Terms of Use**
+
+This model is open access and available to all, with a CreativeML OpenRAIL-M license further specifying rights and usage.
+
+The CreativeML OpenRAIL License specifies:
+
+You can't use the model to deliberately produce nor share illegal or harmful outputs or content
+CompVis claims no rights on the outputs you generate, you are free to use them and are accountable for their use which must not go against the provisions set in the license
+You may re-distribute the weights and use the model commercially and/or as a service. If you do, please be aware you have to include the same use restrictions as the ones in the license and share a copy of the CreativeML OpenRAIL-M to all your users (please read the license entirely and carefully)
+
+
+Please read the full license here: https://huggingface.co/spaces/CompVis/stable-diffusion-license
 """
 
 # %%
@@ -80,7 +101,7 @@ if setup_environment:
     all_process = [
         ['pip', 'install', 'torch==1.12.1+cu113', 'torchvision==0.13.1+cu113', '--extra-index-url', 'https://download.pytorch.org/whl/cu113'],
         ['pip', 'install', 'omegaconf==2.2.3', 'einops==0.4.1', 'pytorch-lightning==1.7.4', 'torchmetrics==0.9.3', 'torchtext==0.13.1', 'transformers==4.21.2', 'kornia==0.6.7'],
-        ['git', 'clone', '-b', 'conditioning', 'https://github.com/enzymezoo-code/stable-diffusion'],
+        ['git', 'clone', '-b', 'conditioning', 'https://github.com/deforum/stable-diffusion'],
         ['pip', 'install', '-e', 'git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers'],
         ['pip', 'install', '-e', 'git+https://github.com/openai/CLIP.git@main#egg=clip'],
         ['pip', 'install', 'accelerate', 'ftfy', 'jsonmerge', 'matplotlib', 'resize-right', 'timm', 'torchdiffeq'],
@@ -97,15 +118,11 @@ if setup_environment:
     with open('k-diffusion/k_diffusion/__init__.py', 'w') as f:
         f.write('')
 
+    pip_sub_p_res = subprocess.run(['pip', 'install', 'git+https://github.com/openai/CLIP'], stdout=subprocess.PIPE).stdout.decode('utf-8') #<cc-cm>
+    print(pip_sub_p_res) #<cc-cm>
+
     end_time = time.time()
     print(f"Environment set up in {end_time-start_time:.0f} seconds")
-
-# %%
-# !! {"metadata":{
-# !!   "id": "LJq1juNP92xy"
-# !! }}
-pip_sub_p_res = subprocess.run(['pip', 'install', 'git+https://github.com/openai/CLI'], stdout=subprocess.PIPE).stdout.decode('utf-8') #<cc-cm>
-print(pip_sub_p_res) #<cc-cm>
 
 
 # %%
@@ -137,6 +154,7 @@ from tqdm import tqdm, trange
 from types import SimpleNamespace
 from torch import autocast
 from sklearn.cluster import KMeans
+import re
 from scipy.ndimage import gaussian_filter
 
 sys.path.extend([
@@ -151,11 +169,17 @@ sys.path.extend([
 
 import py3d_tools as p3d
 
-from helpers import DepthModel, sampler_fn
+from helpers import DepthModel, sampler_fn, CFGDenoiserWithGrad
 from k_diffusion.external import CompVisDenoiser
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+
+
+import clip
+from torchvision.transforms import Normalize as Normalize
+from torch.nn import functional as F
+
 
 def sanitize(prompt):
     whitelist = set('abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ')
@@ -428,6 +452,79 @@ def maintain_colors(prev_img, color_match_sample, mode):
 # Loss functions
 ###
 
+
+## CLIP -----------------------------------------
+
+class MakeCutouts(nn.Module):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
+        super().__init__()
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow
+
+    def forward(self, input):
+        sideY, sideX = input.shape[2:4]
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, self.cut_size)
+        cutouts = []
+        for _ in range(self.cutn):
+            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
+            offsetx = torch.randint(0, sideX - size + 1, ())
+            offsety = torch.randint(0, sideY - size + 1, ())
+            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
+        return torch.cat(cutouts)
+
+
+def spherical_dist_loss(x, y):
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+
+def make_clip_loss_fn(clip_model, clip_prompts, cutn=1, cut_pow=1):
+    clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
+
+    def parse_prompt(prompt):
+        if prompt.startswith('http://') or prompt.startswith('https://'):
+            vals = prompt.rsplit(':', 2)
+            vals = [vals[0] + ':' + vals[1], *vals[2:]]
+        else:
+            vals = prompt.rsplit(':', 1)
+        vals = vals + ['', '1'][len(vals):]
+        return vals[0], float(vals[1])
+
+    def parse_clip_prompts(clip_prompts):
+        target_embeds, weights = [], []
+        for prompt in clip_prompts:
+            txt, weight = parse_prompt(prompt)
+            target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
+            weights.append(weight)
+        target_embeds = torch.cat(target_embeds)
+        weights = torch.tensor(weights, device=device)
+        if weights.sum().abs() < 1e-3:
+            raise RuntimeError('Clip prompt weights must not sum to 0.')
+        weights /= weights.sum().abs()
+        return target_embeds, weights
+
+    normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                          std=[0.26862954, 0.26130258, 0.27577711])
+
+    make_cutouts = MakeCutouts(clip_size, cutn, cut_pow)
+    target_embeds, weights = parse_clip_prompts(clip_prompts)
+
+    def clip_loss_fn(x, sigma, **kwargs):
+        nonlocal target_embeds, weights, make_cutouts, normalize
+        clip_in = normalize(make_cutouts(x.add(1).div(2)))
+        image_embeds = clip_model.encode_image(clip_in).float()
+        dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
+        dists = dists.view([cutn, 1, -1])
+        losses = dists.mul(weights).sum(2).mean(0)
+        return losses.sum()
+    
+    return clip_loss_fn
+
+## end CLIP -----------------------------------------
+
 # blue loss from @johnowhitaker's tutorial on Grokking Stable Diffusion
 def blue_loss_fn(x, sigma, **kwargs):
   # How far are the blue channel values to 0.9:
@@ -441,12 +538,19 @@ def make_mse_loss(target):
     return mse_loss
 
 
-def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None):
-
-    assert n_colors > 0, "Must use at least one color"
+def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None, img_shape=None, device='cuda:0'):
+    """
+    target (tensor): Image sample (values from -1 to 1) to extract the color palette
+    n_colors (int): Number of colors in the color palette
+    ignore_sat_scale (None or number>0): Scale to ignore color saturation in color comparison
+    img_shape (None or (int, int)): shape (width, height) of sample that the conditioning gradient is applied to, 
+                                    if None then calculate target color distribution during gradient calculation 
+                                    rather than once at the beginning
+    """
+    assert n_colors > 0, "Must use at least one color with color match loss"
 
     def display_color_palette(color_list):
-        # Expand to 64x64 grid of color pixels
+        # Expand to 64x64 grid of single color pixels
         images = color_list.unsqueeze(2).repeat(1,1,64).unsqueeze(3).repeat(1,1,1,64)
         images = images.double().cpu().add(1).div(2).clamp(0, 1)
         images = torch.tensor(np.array(images))
@@ -454,38 +558,80 @@ def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None):
         display.display(TF.to_pil_image(grid))
         return
 
-    if ignore_sat_scale is None:
+    def adjust_saturation(sample, saturation_factor):
+        # as in torchvision.transforms.functional.adjust_saturation, but for tensors with values from -1,1
+        return blend(sample, TF.rgb_to_grayscale(sample), saturation_factor)
+
+    def blend(img1, img2, ratio):
+        return (ratio * img1 + (1.0 - ratio) * img2).clamp(-1, 1).to(img1.dtype)
+
+    def get_color_palette(n_colors, target):
+        # Create color palette
         kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
-    else:
-        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(TF.adjust_saturation(target[0].float(),ignore_sat_scale),1,2).T.cpu().numpy())
-    color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
-    display_color_palette(color_list)
-    print('color_list',color_list)
-    # Get ratio of each color class in the target image
-    color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
-    color_list = color_list[color_indexes]
-    color_ratios = color_counts / torch.sum(torch.Tensor(color_counts))
-    print('color_ratios',color_ratios)
+        color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
+        display_color_palette(color_list)
+        # Get ratio of each color class in the target image
+        color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
+        # color_list = color_list[color_indexes]
+        return color_list, color_counts
 
+    def color_distance_distributions(n_colors, img_shape, color_list, color_counts, n_images=1):
+        # Get the target color distance distributions
+        # Ensure color counts total the amout of pixels in the image
+        n_pixels = img_shape[0]*img_shape[1]
+        color_counts = (color_counts * n_pixels / sum(color_counts)).astype(int)
+        
+        # Make color distances for each color, sorted by distance
+        color_distributions = torch.zeros((n_colors, n_images, n_pixels), device=device)
+        for i_image in range(n_images):
+            for ic,color0 in enumerate(color_list):
+                i_dist = 0
+                for jc,color1 in enumerate(color_list):
+                    color_dist = torch.linalg.norm(color0 - color1)
+                    color_distributions[ic, i_image, i_dist:i_dist+color_counts[jc]] = color_dist
+                    i_dist += color_counts[jc]
+        color_distributions, _ = torch.sort(color_distributions,dim=2)
+        return color_distributions
 
-    def rgb_color_match_loss(x, sigma, **kwargs):
-        min_color_norm_distances = torch.ones(x.shape).to(device) * 2.0 # difference won't be more than 2 if values are between -1 and 1
-        for color in color_list:
+    color_list, color_counts = get_color_palette(n_colors, target)
+    color_distributions = None
+    if img_shape is not None:
+        color_distributions = color_distance_distributions(n_colors, img_shape, color_list, color_counts)
+
+    def rgb_color_ratio_loss(x, sigma, **kwargs):
+        nonlocal color_distributions
+        all_color_norm_distances = torch.ones(len(color_list), x.shape[0], x.shape[2], x.shape[3]).to(device) * 6.0 # distance to color won't be more than max norm1 distance between -1 and 1 in 3 color dimensions
+
+        for ic,color in enumerate(color_list):
+            # Make a tensor of entirely one color
             color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
-            if ignore_sat_scale is None:
+            # Get the color distances
+            if ignore_sat_scale is None or ignore_sat_scale == 0:
+                # Simple color distance
                 color_distances = torch.linalg.norm(x - color,  dim=1)
             else:
-                color_distances = torch.linalg.norm(TF.adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
-            min_color_norm_distances = torch.minimum(min_color_norm_distances,color_distances)
+                # Color distance if the colors were saturated
+                # This is to make color comparison ignore shadows and highlights, for example
+                color_distances = torch.linalg.norm(adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
 
-        # # Get ratio of each color class
-        # # get the class of each
-        # color_classes = ... WIP. Might have to use Wasserstein metric instead for color ratios
-        # color_counts = torch.unique(color_classes, return_counts=True)
+            all_color_norm_distances[ic] = color_distances
+        all_color_norm_distances = torch.flatten(all_color_norm_distances,start_dim=2)
+
+        if color_distributions is None:
+            color_distributions = color_distance_distributions(n_colors, 
+                                                               (x.shape[2], x.shape[3]), 
+                                                               color_list, 
+                                                               color_counts, 
+                                                               n_images=x.shape[0])
+
+        # Sort the color distances so we can compare them as if they were a cumulative distribution function
+        all_color_norm_distances, _ = torch.sort(all_color_norm_distances,dim=2)
         
-        return min_color_norm_distances.square().mean()
+        color_norm_distribution_diff = all_color_norm_distances - color_distributions
 
-    return rgb_color_match_loss
+        return color_norm_distribution_diff.square().mean()
+        
+    return rgb_color_ratio_loss
 
 
 ###
@@ -520,74 +666,6 @@ def threshold_by(threshold, threshold_type):
   else:
       raise Exception(f"Thresholding type {threshold_type} not supported")
 
-
-###
-# Conditioning helper functions
-###
-# Decodes the image without passing through the upscaler. The resulting image will be the same size as the latent
-# Thanks to Kevin Turner (https://github.com/keturn) we have a shortcut to look at the decoded image!
-def make_simple_decode(model_name, device='cuda:0'):
-    v1_4_rgb_latent_factors = [
-        #   R       G       B
-        [ 0.298,  0.207,  0.208],  # L1
-        [ 0.187,  0.286,  0.173],  # L2
-        [-0.158,  0.189,  0.264],  # L3
-        [-0.184, -0.271, -0.473],  # L4
-    ]
-
-    if model_name == "sd-v1-4":
-        rgb_latent_factors = torch.Tensor(v1_4_rgb_latent_factors).to(device)
-    else:
-      raise Exception(f"Model name {model_name} not recognized.")
-
-    def simple_decode(latent):
-        latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
-        latent_image = latent_image.permute(0, 3, 1, 2)
-        return latent_image
-    
-    return simple_decode
-
-
-def make_cond_fn(loss_fn, scale, wrt='x', decode_method=None, verbose=False):
-    # Turns a loss function into a cond function that is applied to the decoded RGB sample
-    # loss_fn (function): func(x, sigma, denoised) -> number
-    # scale (number): how much this loss is applied to the image
-    # wrt (str): ['x','x0_pred'] get the gradient with respect to this variable, default x
-    # decode_method (str): ['autoencoder','linear'] method to decode the latent to an image
-    if wrt is None:
-        wrt = 'x'
-
-    if decode_method is None:
-        decode_func = lambda x: x
-    elif decode_method == "autoencoder":
-        decode_func = model.differentiable_decode_first_stage
-    elif decode_method == "linear":
-        decode_func = simple_decode
-
-    def cond_fn(x, sigma, denoised, **kwargs):
-        with torch.enable_grad():
-            denoised_sample = decode_func(denoised).requires_grad_()
-            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
-            grad = -torch.autograd.grad(loss, x)[0]
-        verbose_print('Loss:', loss.item())
-        return grad
-
-    def cond_fn_pred(x, sigma, denoised, **kwargs):
-        with torch.enable_grad():
-            denoised_sample = decode_func(denoised).requires_grad_()
-            loss = loss_fn(denoised_sample, sigma, **kwargs) * scale
-            grad = -torch.autograd.grad(loss, denoised)[0]
-        verbose_print('Loss:', loss.item())
-        return grad
-
-    verbose_print = print if verbose else lambda *args, **kwargs: None
-    
-    if wrt == 'x':
-        return cond_fn
-    elif wrt == 'x0_pred':
-        return cond_fn_pred
-    else:
-        raise Exception(f"Variable wrt == {wrt} not recognised.")
 
 #
 # Callback functions
@@ -640,8 +718,8 @@ class SamplerCallback(object):
         self.verbose_print = print if verbose else lambda *args, **kwargs: None
 
     def view_sample_step(self, latents, path_name_modifier=''):
-        samples = model.decode_first_stage(latents)
         if self.save_sample_per_step:
+            samples = model.decode_first_stage(latents)
             fname = f'{path_name_modifier}_{self.step_index:05}.png'
             for i, sample in enumerate(samples):
                 sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
@@ -649,6 +727,7 @@ class SamplerCallback(object):
                 grid = make_grid(sample, 4).cpu()
                 TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
         if self.show_sample_per_step:
+            samples = model.linear_decode(latents)
             print(path_name_modifier)
             self.display_images(samples)
         return
@@ -756,47 +835,131 @@ def transform_image_3d(prev_img_cv2, depth_tensor, rot_mat, translate, anim_args
     ).cpu().numpy().astype(prev_img_cv2.dtype)
     return result
 
+def check_is_number(value):
+    float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
+    return re.match(float_pattern, value)
 
-## CLIP -----------------------------------------
+# prompt weighting with colons and number coefficients (like 'bacon:0.75 eggs:0.25')
+# borrowed from https://github.com/kylewlacy/stable-diffusion/blob/0a4397094eb6e875f98f9d71193e350d859c4220/ldm/dream/conditioning.py
+# and https://github.com/raefu/stable-diffusion-automatic/blob/unstablediffusion/modules/processing.py
+def get_uc_and_c(prompts, model, args, frame = 0):
+    prompt = prompts[0] # they are the same in a batch anyway
 
-class MakeCutouts(nn.Module):
-    def __init__(self, cut_size, cutn, cut_pow=1.):
-        super().__init__()
-        self.cut_size = cut_size
-        self.cutn = cutn
-        self.cut_pow = cut_pow
+    # get weighted sub-prompts
+    negative_subprompts, positive_subprompts = split_weighted_subprompts(
+        prompt, frame, not args.normalize_prompt_weights
+    )
 
-    def forward(self, input):
-        sideY, sideX = input.shape[2:4]
-        max_size = min(sideX, sideY)
-        min_size = min(sideX, sideY, self.cut_size)
-        cutouts = []
-        for _ in range(self.cutn):
-            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
-            offsetx = torch.randint(0, sideX - size + 1, ())
-            offsety = torch.randint(0, sideY - size + 1, ())
-            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
-            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
-        return torch.cat(cutouts)
+    uc = get_learned_conditioning(model, negative_subprompts, "", args, -1)
+    c = get_learned_conditioning(model, positive_subprompts, prompt, args, 1)
 
+    return (uc, c)
 
-def spherical_dist_loss(x, y):
-    x = F.normalize(x, dim=-1)
-    y = F.normalize(y, dim=-1)
-    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+def get_learned_conditioning(model, weighted_subprompts, text, args, sign = 1):
+    if len(weighted_subprompts) < 1:
+        log_tokenization(text, model, args.log_weighted_subprompts, sign)
+        c = model.get_learned_conditioning(args.n_samples * [text])
+    else:
+        c = None
+        for subtext, subweight in weighted_subprompts:
+            log_tokenization(subtext, model, args.log_weighted_subprompts, sign * subweight)
+            if c is None:
+                c = model.get_learned_conditioning(args.n_samples * [subtext])
+                c *= subweight
+            else:
+                c.add_(model.get_learned_conditioning(args.n_samples * [subtext]), alpha=subweight)
+        
+    return c
 
+def parse_weight(match, frame = 0)->float:
+    import numexpr
+    w_raw = match.group("weight")
+    if w_raw == None:
+        return 1
+    if check_is_number(w_raw):
+        return float(w_raw)
+    else:
+        t = frame
+        if len(w_raw) < 3:
+            print('the value inside `-characters cannot represent a math function')
+            return 1
+        return float(numexpr.evaluate(w_raw[1:-1]))
 
-def clip_loss_fn(x, sigma, **kwargs):
-    clip_in = normalize(make_cutouts(x.add(1).div(2)))
-    image_embeds = clip_model.encode_image(clip_in).float()
-    dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
-    dists = dists.view([cutn, 1, -1])
-    losses = dists.mul(weights).sum(2).mean(0)
-    return losses.sum()
+def normalize_prompt_weights(parsed_prompts):
+    if len(parsed_prompts) == 0:
+        return parsed_prompts
+    weight_sum = sum(map(lambda x: x[1], parsed_prompts))
+    if weight_sum == 0:
+        print(
+            "Warning: Subprompt weights add up to zero. Discarding and using even weights instead.")
+        equal_weight = 1 / max(len(parsed_prompts), 1)
+        return [(x[0], equal_weight) for x in parsed_prompts]
+    return [(x[0], x[1] / weight_sum) for x in parsed_prompts]
 
-## CLIP -----------------------------------------
+def split_weighted_subprompts(text, frame = 0, skip_normalize=False):
+    """
+    grabs all text up to the first occurrence of ':'
+    uses the grabbed text as a sub-prompt, and takes the value following ':' as weight
+    if ':' has no value defined, defaults to 1.0
+    repeats until no text remaining
+    """
+    prompt_parser = re.compile("""
+            (?P<prompt>         # capture group for 'prompt'
+            (?:\\\:|[^:])+      # match one or more non ':' characters or escaped colons '\:'
+            )                   # end 'prompt'
+            (?:                 # non-capture group
+            :+                  # match one or more ':' characters
+            (?P<weight>((        # capture group for 'weight'
+            -?\d+(?:\.\d+)?     # match positive or negative integer or decimal number
+            )|(                 # or
+            `[\S\s]*?`# a math function
+            )))?                 # end weight capture group, make optional
+            \s*                 # strip spaces after weight
+            |                   # OR
+            $                   # else, if no ':' then match end of line
+            )                   # end non-capture group
+            """, re.VERBOSE)
+    negative_prompts = []
+    positive_prompts = []
+    for match in re.finditer(prompt_parser, text):
+        w = parse_weight(match, frame)
+        if w < 0:
+            # negating the sign as we'll feed this to uc
+            negative_prompts.append((match.group("prompt").replace("\\:", ":"), -w))
+        elif w > 0:
+            positive_prompts.append((match.group("prompt").replace("\\:", ":"), w))
 
-def generate(args, return_latent=False, return_sample=False, return_c=False):
+    if skip_normalize:
+        return (negative_prompts, positive_prompts)
+    return (normalize_prompt_weights(negative_prompts), normalize_prompt_weights(positive_prompts))
+
+# shows how the prompt is tokenized
+# usually tokens have '</w>' to indicate end-of-word,
+# but for readability it has been replaced with ' '
+def log_tokenization(text, model, log=False, weight=1):
+    if not log:
+        return
+    tokens    = model.cond_stage_model.tokenizer._tokenize(text)
+    tokenized = ""
+    discarded = ""
+    usedTokens = 0
+    totalTokens = len(tokens)
+    for i in range(0, totalTokens):
+        token = tokens[i].replace('</w>', ' ')
+        # alternate color
+        s = (usedTokens % 6) + 1
+        if i < model.cond_stage_model.max_length:
+            tokenized = tokenized + f"\x1b[0;3{s};40m{token}"
+            usedTokens += 1
+        else:  # over max token length
+            discarded = discarded + f"\x1b[0;3{s};40m{token}"
+    print(f"\n>> Tokens ({usedTokens}), Weight ({weight:.2f}):\n{tokenized}\x1b[0m")
+    if discarded != "":
+        print(
+            f">> Tokens Discarded ({totalTokens-usedTokens}):\n{discarded}\x1b[0m"
+        )
+
+def generate(args, frame = 0, return_latent=False, return_sample=False, return_c=False):
     seed_everything(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -869,52 +1032,81 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
     else:
         colormatch_image = None
 
-    cond_fns = [
-        make_cond_fn(clip_loss_fn, args.clip_loss_scale, wrt=args.gradient_wrt, decode_method=args.decode_method, verbose=False) if args.clip_loss_scale != 0 else None,
-        make_cond_fn(blue_loss_fn, args.blue_loss_scale, decode_method=args.decode_method, verbose=True) if args.blue_loss_scale != 0 else None,
-        make_cond_fn(make_mse_loss(init_image), args.init_mse_scale, decode_method=args.decode_method, verbose=True) if args.init_mse_scale != 0 else None,
-        make_cond_fn(make_rgb_color_match_loss(colormatch_image, n_colors=args.colormatch_n_colors, ignore_sat_scale=args.ignore_sat_scale), args.colormatch_loss_scale, decode_method=args.decode_method, verbose=True) if args.colormatch_loss_scale != 0 else None,
-        ]
+    # Loss functions
+    mse_loss_fn = make_mse_loss(init_image)
+    if args.colormatch_loss_scale != 0:
+        if args.decode_method == "linear":
+            grad_img_shape = (int(args.W/args.f), int(args.H/args.f))
+        else:
+            grad_img_shape = (args.W, args.H)
+        color_loss_fn = make_rgb_color_match_loss(colormatch_image, 
+                                                  n_colors=args.colormatch_n_colors, 
+                                                  img_shape=grad_img_shape,
+                                                  ignore_sat_scale=args.ignore_sat_scale)
+    else:
+        color_loss_fn = None
+    if args.clip_loss_scale != 0:
+        clip_loss_fn = make_clip_loss_fn(clip_model=clip_model, 
+                                        clip_prompts=clip_prompts, 
+                                        cutn=args.cutn, 
+                                        cut_pow=args.cut_pow)
+    else:
+        clip_loss_fn = None
 
-
-    clamp_func = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+    loss_fns_scales = [
+        [clip_loss_fn,              args.clip_loss_scale],
+        [blue_loss_fn,              args.blue_loss_scale],
+        [mse_loss_fn,               args.init_mse_scale],
+        [color_loss_fn,             args.colormatch_loss_scale],
+    ]
 
     callback = SamplerCallback(args=args,
                             mask=mask, 
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            verbose=False).callback  
+                            verbose=False).callback 
+
+    clamp_fn = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+
+    cfg_model = CFGDenoiserWithGrad(model_wrap, 
+                                    loss_fns_scales, 
+                                    clamp_fn, 
+                                    args.gradient_wrt, 
+                                    args.gradient_add_to, 
+                                    args.cond_uncond_sync,
+                                    decode_method=args.decode_method,
+                                    verbose=False)
 
     results = []
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
                 for prompts in data:
-                    uc = None
-                    if args.scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
                     if isinstance(prompts, tuple):
                         prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
+                    if args.prompt_weighting:
+                        uc, c = get_uc_and_c(prompts, model, args, frame)
+                    else:
+                        uc = model.get_learned_conditioning(batch_size * [""])
+                        c = model.get_learned_conditioning(prompts)
 
+
+                    if args.scale == 1.0:
+                        uc = None
                     if args.init_c != None:
                         c = args.init_c
 
                     if args.sampler in ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral"]:
+
                         samples = sampler_fn(
                             c=c, 
                             uc=uc, 
                             args=args, 
-                            model_wrap=model_wrap, 
+                            model_wrap=cfg_model, 
                             init_latent=init_latent, 
                             t_enc=t_enc, 
-                            cond_fns=cond_fns,
-                            clamp_func=clamp_func,
                             device=device, 
-                            gradient_wrt=args.gradient_wrt,
-                            gradient_add_to=args.gradient_add_to,
-                            cond_uncond_sync=args.cond_uncond_sync,
                             cb=callback,
                             verbose=False)
                     else:
@@ -997,7 +1189,9 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
 #@markdown **Select and Load Model**
 
 model_config = "v1-inference.yaml" #@param ["custom","v1-inference.yaml"]
-model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt"]
+model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt", "robo-diffusion-v1.ckpt","waifu-diffusion-v1-3.ckpt"]
+if model_checkpoint == "waifu-diffusion-v1-3.ckpt":
+    model_checkpoint = "model-epoch05-float16.ckpt"
 custom_config_path = "" #@param {type:"string"}
 custom_checkpoint_path = "" #@param {type:"string"}
 
@@ -1006,14 +1200,56 @@ half_precision = True # check
 check_sha256 = True #@param {type:"boolean"}
 
 model_map = {
-    "sd-v1-4-full-ema.ckpt": {'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a'},
-    "sd-v1-4.ckpt": {'sha256': 'fe4efff1e174c627256e44ec2991ba279b3816e364b49f9be2abc0b3ff3f8556'},
-    "sd-v1-3-full-ema.ckpt": {'sha256': '54632c6e8a36eecae65e36cb0595fab314e1a1545a65209f24fde221a8d4b2ca'},
-    "sd-v1-3.ckpt": {'sha256': '2cff93af4dcc07c3e03110205988ff98481e86539c51a8098d4f2236e41f7f2f'},
-    "sd-v1-2-full-ema.ckpt": {'sha256': 'bc5086a904d7b9d13d2a7bccf38f089824755be7261c7399d92e555e1e9ac69a'},
-    "sd-v1-2.ckpt": {'sha256': '3b87d30facd5bafca1cbed71cfb86648aad75d1c264663c0cc78c7aea8daec0d'},
-    "sd-v1-1-full-ema.ckpt": {'sha256': 'efdeb5dc418a025d9a8cc0a8617e106c69044bc2925abecc8a254b2910d69829'},
-    "sd-v1-1.ckpt": {'sha256': '86cd1d3ccb044d7ba8db743d717c9bac603c4043508ad2571383f954390f3cea'}
+    "sd-v1-4-full-ema.ckpt": {
+        'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-2-original/blob/main/sd-v1-4-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-4.ckpt": {
+        'sha256': 'fe4efff1e174c627256e44ec2991ba279b3816e364b49f9be2abc0b3ff3f8556',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-3-full-ema.ckpt": {
+        'sha256': '54632c6e8a36eecae65e36cb0595fab314e1a1545a65209f24fde221a8d4b2ca',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-3-original/blob/main/sd-v1-3-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-3.ckpt": {
+        'sha256': '2cff93af4dcc07c3e03110205988ff98481e86539c51a8098d4f2236e41f7f2f',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-3-original/resolve/main/sd-v1-3.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-2-full-ema.ckpt": {
+        'sha256': 'bc5086a904d7b9d13d2a7bccf38f089824755be7261c7399d92e555e1e9ac69a',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-2-original/blob/main/sd-v1-2-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-2.ckpt": {
+        'sha256': '3b87d30facd5bafca1cbed71cfb86648aad75d1c264663c0cc78c7aea8daec0d',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-2-original/resolve/main/sd-v1-2.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-1-full-ema.ckpt": {
+        'sha256': 'efdeb5dc418a025d9a8cc0a8617e106c69044bc2925abecc8a254b2910d69829',
+        'url':'https://huggingface.co/CompVis/stable-diffusion-v-1-1-original/resolve/main/sd-v1-1-full-ema.ckpt',
+        'requires_login': True,
+        },
+    "sd-v1-1.ckpt": {
+        'sha256': '86cd1d3ccb044d7ba8db743d717c9bac603c4043508ad2571383f954390f3cea',
+        'url': 'https://huggingface.co/CompVis/stable-diffusion-v-1-1-original/resolve/main/sd-v1-1.ckpt',
+        'requires_login': True,
+        },
+    "robo-diffusion-v1.ckpt": {
+        'sha256': '244dbe0dcb55c761bde9c2ac0e9b46cc9705ebfe5f1f3a7cc46251573ea14e16',
+        'url': 'https://huggingface.co/nousr/robo-diffusion/resolve/main/models/robo-diffusion-v1.ckpt',
+        'requires_login': False,
+        },
+    "model-epoch05-float16.ckpt": {
+        'sha256': '26cf2a2e30095926bb9fd9de0c83f47adc0b442dbfdc3d667d43778e8b70bece',
+        'url': 'https://huggingface.co/hakurei/waifu-diffusion-v1-3/resolve/main/model-epoch05-float16.ckpt',
+        'requires_login': False,
+        },
 }
 
 # config path
@@ -1029,6 +1265,37 @@ ckpt_path = custom_checkpoint_path if model_checkpoint == "custom" else os.path.
 ckpt_valid = True
 if os.path.exists(ckpt_path):
     print(f"{ckpt_path} exists")
+elif 'url' in model_map[model_checkpoint]:
+    url = model_map[model_checkpoint]['url']
+
+    # CLI dialogue to authenticate download
+    if model_map[model_checkpoint]['requires_login']:
+        print("This model requires an authentication token")
+        print("Please ensure you have accepted its terms of service before continuing.")
+
+        username = input("What is your huggingface username?:")
+        token = input("What is your huggingface token?:")
+
+        _, path = url.split("https://")
+
+        url = f"https://{username}:{token}@{path}"
+
+    # contact server for model
+    print(f"Attempting to download {model_checkpoint}...this may take a while")
+    ckpt_request = requests.get(url)
+    request_status = ckpt_request.status_code
+
+    # inform user of errors
+    if request_status == 403:
+      raise ConnectionRefusedError("You have not accepted the license for this model.")
+    elif request_status == 404:
+      raise ConnectionError("Could not make contact with server")
+    elif request_status != 200:
+      raise ConnectionError(f"Some other error has ocurred - response code: {request_status}")
+
+    # write to model path
+    with open(os.path.join(models_path, model_checkpoint), 'wb') as model_file:
+        model_file.write(ckpt_request.content)
 else:
     print(f"Please download model checkpoint and place in {os.path.join(models_path, model_checkpoint)}")
     ckpt_valid = False
@@ -1072,14 +1339,38 @@ def load_model_from_config(config, ckpt, verbose=False, device='cuda', half_prec
     model.eval()
     return model
 
+#
+# Decodes the image without passing through the upscaler. The resulting image will be the same size as the latent
+# Thanks to Kevin Turner (https://github.com/keturn) we have a shortcut to look at the decoded image!
+def make_linear_decode(model_version, device='cuda:0'):
+    v1_4_rgb_latent_factors = [
+        #   R       G       B
+        [ 0.298,  0.207,  0.208],  # L1
+        [ 0.187,  0.286,  0.173],  # L2
+        [-0.158,  0.189,  0.264],  # L3
+        [-0.184, -0.271, -0.473],  # L4
+    ]
+
+    if model_version[:5] == "sd-v1":
+        rgb_latent_factors = torch.Tensor(v1_4_rgb_latent_factors).to(device)
+    else:
+        raise Exception(f"Model name {model_version} not recognized.")
+
+    def linear_decode(latent):
+        latent_image = latent.permute(0, 2, 3, 1) @ rgb_latent_factors
+        latent_image = latent_image.permute(0, 3, 1, 2)
+        return latent_image
+    
+    return linear_decode
+
 if load_on_run_all and ckpt_valid:
     local_config = OmegaConf.load(f"{ckpt_config_path}")
     model = load_model_from_config(local_config, f"{ckpt_path}", half_precision=half_precision)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
+    autoencoder_version = "sd-v1" #TODO this will be different for different models
+    model.linear_decode = make_linear_decode(autoencoder_version, device)
 
-#TODO Get model name information to use linear decoder that is specific for the model
-simple_decode = make_simple_decode(model_checkpoint.split('.')[0], device)
 
 # %%
 # !! {"metadata":{
@@ -1108,7 +1399,7 @@ def DeforumAnimArgs():
     #@markdown ####**Animation:**
     animation_mode = 'None' #@param ['None', '2D', '3D', 'Video Input', 'Interpolation'] {type:'string'}
     max_frames = 1000 #@param {type:"number"}
-    border = 'wrap' #@param ['wrap', 'replicate'] {type:'string'}
+    border = 'replicate' #@param ['wrap', 'replicate'] {type:'string'}
 
     #@markdown ####**Motion Parameters:**
     angle = "0:(0)"#@param {type:"string"}
@@ -1119,7 +1410,7 @@ def DeforumAnimArgs():
     rotation_3d_x = "0:(0)"#@param {type:"string"}
     rotation_3d_y = "0:(0)"#@param {type:"string"}
     rotation_3d_z = "0:(0)"#@param {type:"string"}
-    flip_2d_perspective = True #@param {type:"boolean"}
+    flip_2d_perspective = False #@param {type:"boolean"}
     perspective_flip_theta = "0:(0)"#@param {type:"string"}
     perspective_flip_phi = "0:(t%15)"#@param {type:"string"}
     perspective_flip_gamma = "0:(0)"#@param {type:"string"}
@@ -1180,14 +1471,12 @@ class DeformAnimKeys():
 
 def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'):
     import numexpr
-    import re
-    float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
     key_frame_series = pd.Series([np.nan for a in range(max_frames)])
     
     for i in range(0, max_frames):
         if i in key_frames:
             value = key_frames[i]
-            value_is_number = re.match(float_pattern, value)
+            value_is_number = check_is_number(value)
             # if it's only a number, leave the rest for the default interpolation
             if value_is_number:
                 t = i
@@ -1210,7 +1499,6 @@ def get_inbetweens(key_frames, max_frames, integer=False, interp_method='Linear'
     return key_frame_series
 
 def parse_key_frames(string, prompt_parser=None):
-    import re
     # because math functions (i.e. sin(t)) can utilize brackets 
     # it extracts the value in form of some stuff
     # which has previously been enclosed with brackets and
@@ -1228,7 +1516,6 @@ def parse_key_frames(string, prompt_parser=None):
         raise RuntimeError('Key Frame string not correctly formatted')
     return frames
 
-
 # %%
 # !! {"metadata":{
 # !!   "id": "63UOJvU3xdPS"
@@ -1244,10 +1531,15 @@ def parse_key_frames(string, prompt_parser=None):
 # !! }}
 
 prompts = [
-    "a beautiful forest by Asher Brown Durand, trending on Artstation", #the first prompt I want
-    "a beautiful portrait of a woman by Artgerm, trending on Artstation", #the second prompt I want
-    #"the third prompt I don't want it I commented it with an",
+    "a beautiful forest by Asher Brown Durand, trending on Artstation", # the first prompt I want
+    "a beautiful portrait of a woman by Artgerm, trending on Artstation", # the second prompt I want
+    #"this prompt I don't want it I commented it out",
+    #"a nousr robot, trending on Artstation", # use "nousr robot" with the robot diffusion model (see model_checkpoint setting)
+    #"touhou 1girl komeiji_koishi portrait, green hair", # waifu diffusion prompts can use danbooru tag groups (see model_checkpoint)
+    #"this prompt has weights if prompt weighting enabled:2 can also do negative:-2", # (see prompt_weighting)
 ]
+
+clip_prompts = ['hyperdetailed matte illustration geometric pattern']
 
 animation_prompts = {
     0: "a beautiful apple, trending on Artstation",
@@ -1255,6 +1547,7 @@ animation_prompts = {
     30: "a beautiful coconut, trending on Artstation",
     40: "a beautiful durian, trending on Artstation",
 }
+
 
 # %%
 # !! {"metadata":{
@@ -1266,66 +1559,10 @@ animation_prompts = {
 
 # %%
 # !! {"metadata":{
-# !!   "id": "2ibI5xBo-HZs"
-# !! }}
-import clip
-from torchvision import transforms
-from torch.nn import functional as F
-
-# %%
-# !! {"metadata":{
-# !!   "id": "yZEhWtuC9saB"
-# !! }}
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-print('Using device:', device)
-
-clip_name = 'ViT-L/14' # 'ViT-L/14@336px' #'ViT-B/16' #
-clip_model = clip.load(clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
-clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
-normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                 std=[0.26862954, 0.26130258, 0.27577711])
-
-# %%
-# !! {"metadata":{
-# !!   "id": "5AFKxKKM9wKS"
-# !! }}
-cutn = 1
-cut_pow = 0.0001
-
-def parse_prompt(prompt):
-    if prompt.startswith('http://') or prompt.startswith('https://'):
-        vals = prompt.rsplit(':', 2)
-        vals = [vals[0] + ':' + vals[1], *vals[2:]]
-    else:
-        vals = prompt.rsplit(':', 1)
-    vals = vals + ['', '1'][len(vals):]
-    return vals[0], float(vals[1])
-
-clip_prompts = ['hyperdetailed matte illustration geometric pattern']
-
-target_embeds, weights = [], []
-
-for prompt in clip_prompts:
-    txt, weight = parse_prompt(prompt)
-    target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
-    weights.append(weight)
-
-cutout_size = clip_size
-
-make_cutouts = MakeCutouts(cutout_size, cutn, cut_pow)
-
-target_embeds = torch.cat(target_embeds)
-weights = torch.tensor(weights, device=device)
-if weights.sum().abs() < 1e-3:
-    raise RuntimeError('The weights must not sum to 0.')
-weights /= weights.sum().abs()
-
-
-# %%
-# !! {"metadata":{
 # !!   "id": "qH74gBWDd2oq",
 # !!   "cellView": "form"
 # !! }}
+#@markdown **Load Settings**
 override_settings_with_file = False #@param {type:"boolean"}
 custom_settings_file = "/content/drive/MyDrive/Settings.txt"#@param {type:"string"}
 
@@ -1346,11 +1583,15 @@ def DeforumArgs():
 
     #@markdown **Save & Display Settings**
     save_samples = True #@param {type:"boolean"}
-    save_sample_per_step = True #@param {type:"boolean"}
     save_settings = True #@param {type:"boolean"}
     display_samples = True #@param {type:"boolean"}
     save_sample_per_step = False #@param {type:"boolean"}
     show_sample_per_step = False #@param {type:"boolean"}
+
+    #@markdown **Prompt Settings**
+    prompt_weighting = False #@param {type:"boolean"}
+    normalize_prompt_weights = True #@param {type:"boolean"}
+    log_weighted_subprompts = False #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
     n_batch = 1 #@param
@@ -1375,28 +1616,31 @@ def DeforumArgs():
     mask_brightness_adjust = 1.0  #@param {type:"number"}
     mask_contrast_adjust = 1.0  #@param {type:"number"}
     # Overlay the masked image at the end of the generation so it does not get degraded by encoding and decoding
-    overlay_mask = True  #@param {type:"boolean"}
+    overlay_mask = True  # {type:"boolean"}
     # Blur edges of final overlay mask, if used. Minimum = 0 (no blur)
-    mask_overlay_blur = 5 #@param {type:"number"}
+    mask_overlay_blur = 5 # {type:"number"}
 
     #@markdown **Conditioning Settings**
-    blue_loss_scale = 0 #@param {type:"number"}
+    blue_loss_scale = 0
     init_mse_scale = 0 #@param {type:"number"}
     clip_loss_scale = 0 #@param {type:"number"}
+    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16']
+    cutn = 1 #@param {type:"number"}
+    cut_pow = 0.0001 #@param {type:"number"}
 
     colormatch_loss_scale = 800 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
-    clamp_grad_threshold = 0.2 #@param {type:"number"}
+    clamp_grad_threshold = 0.1 #@param {type:"number"}
     ignore_sat_scale = 5 #@param 
 
     grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
     gradient_wrt = 'x' #@param ["x", "x0_pred"]
-    gradient_add_to = 'cond' #@param ["cond", "uncond", "both"]
+    gradient_add_to = 'both' #@param ["cond", "uncond", "both"]
     decode_method = 'linear' #@param ["autoencoder","linear"]
 
     #@markdown **Speed vs VRAM Settings**
-    cond_uncond_sync = False #@param {type:"boolean"}
+    cond_uncond_sync = True #@param {type:"boolean"}
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
@@ -1665,7 +1909,7 @@ def render_animation(args, anim_args):
                 args.mask_file = mask_frame
 
         # sample the diffusion model
-        sample, image = generate(args, return_latent=False, return_sample=True)
+        sample, image = generate(args, frame_idx, return_latent=False, return_sample=True)
         if not using_vid_init:
             prev_sample = sample
 
@@ -1882,6 +2126,10 @@ if anim_args.animation_mode == 'None':
     anim_args.max_frames = 1
 elif anim_args.animation_mode == 'Video Input':
     args.use_init = True
+
+# Load clip model if using clip guidance
+if args.clip_loss_scale > 0:
+    clip_model = clip.load(args.clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
 
 # clean up unused memory
 gc.collect()
