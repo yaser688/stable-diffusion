@@ -118,15 +118,11 @@ if setup_environment:
     with open('k-diffusion/k_diffusion/__init__.py', 'w') as f:
         f.write('')
 
+    pip_sub_p_res = subprocess.run(['pip', 'install', 'git+https://github.com/openai/CLIP'], stdout=subprocess.PIPE).stdout.decode('utf-8') #<cc-cm>
+    print(pip_sub_p_res) #<cc-cm>
+
     end_time = time.time()
     print(f"Environment set up in {end_time-start_time:.0f} seconds")
-
-# %%
-# !! {"metadata":{
-# !!   "id": "LJq1juNP92xy"
-# !! }}
-pip_sub_p_res = subprocess.run(['pip', 'install', 'git+https://github.com/openai/CLI'], stdout=subprocess.PIPE).stdout.decode('utf-8') #<cc-cm>
-print(pip_sub_p_res) #<cc-cm>
 
 
 # %%
@@ -178,6 +174,12 @@ from k_diffusion.external import CompVisDenoiser
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+
+
+import clip
+from torchvision.transforms import Normalize as Normalize
+from torch.nn import functional as F
+
 
 def sanitize(prompt):
     whitelist = set('abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ')
@@ -450,6 +452,79 @@ def maintain_colors(prev_img, color_match_sample, mode):
 # Loss functions
 ###
 
+
+## CLIP -----------------------------------------
+
+class MakeCutouts(nn.Module):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
+        super().__init__()
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow
+
+    def forward(self, input):
+        sideY, sideX = input.shape[2:4]
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, self.cut_size)
+        cutouts = []
+        for _ in range(self.cutn):
+            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
+            offsetx = torch.randint(0, sideX - size + 1, ())
+            offsety = torch.randint(0, sideY - size + 1, ())
+            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
+        return torch.cat(cutouts)
+
+
+def spherical_dist_loss(x, y):
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+
+def make_clip_loss_fn(clip_model, clip_prompts, cutn=1, cut_pow=1):
+    clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
+
+    def parse_prompt(prompt):
+        if prompt.startswith('http://') or prompt.startswith('https://'):
+            vals = prompt.rsplit(':', 2)
+            vals = [vals[0] + ':' + vals[1], *vals[2:]]
+        else:
+            vals = prompt.rsplit(':', 1)
+        vals = vals + ['', '1'][len(vals):]
+        return vals[0], float(vals[1])
+
+    def parse_clip_prompts(clip_prompts):
+        target_embeds, weights = [], []
+        for prompt in clip_prompts:
+            txt, weight = parse_prompt(prompt)
+            target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
+            weights.append(weight)
+        target_embeds = torch.cat(target_embeds)
+        weights = torch.tensor(weights, device=device)
+        if weights.sum().abs() < 1e-3:
+            raise RuntimeError('Clip prompt weights must not sum to 0.')
+        weights /= weights.sum().abs()
+        return target_embeds, weights
+
+    normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                          std=[0.26862954, 0.26130258, 0.27577711])
+
+    make_cutouts = MakeCutouts(clip_size, cutn, cut_pow)
+    target_embeds, weights = parse_clip_prompts(clip_prompts)
+
+    def clip_loss_fn(x, sigma, **kwargs):
+        nonlocal target_embeds, weights, make_cutouts, normalize
+        clip_in = normalize(make_cutouts(x.add(1).div(2)))
+        image_embeds = clip_model.encode_image(clip_in).float()
+        dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
+        dists = dists.view([cutn, 1, -1])
+        losses = dists.mul(weights).sum(2).mean(0)
+        return losses.sum()
+    
+    return clip_loss_fn
+
+## end CLIP -----------------------------------------
+
 # blue loss from @johnowhitaker's tutorial on Grokking Stable Diffusion
 def blue_loss_fn(x, sigma, **kwargs):
   # How far are the blue channel values to 0.9:
@@ -463,16 +538,19 @@ def make_mse_loss(target):
     return mse_loss
 
 
-def make_rgb_color_match_loss(target, n_colors, keep_ratios=True, ignore_sat_scale=None, device='cuda:0'):
+def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None, img_shape=None, device='cuda:0'):
     """
     target (tensor): Image sample (values from -1 to 1) to extract the color palette
     n_colors (int): Number of colors in the color palette
     ignore_sat_scale (None or number>0): Scale to ignore color saturation in color comparison
+    img_shape (None or (int, int)): shape (width, height) of sample that the conditioning gradient is applied to, 
+                                    if None then calculate target color distribution during gradient calculation 
+                                    rather than once at the beginning
     """
     assert n_colors > 0, "Must use at least one color with color match loss"
 
     def display_color_palette(color_list):
-        # Expand to 64x64 grid of color pixels
+        # Expand to 64x64 grid of single color pixels
         images = color_list.unsqueeze(2).repeat(1,1,64).unsqueeze(3).repeat(1,1,1,64)
         images = images.double().cpu().add(1).div(2).clamp(0, 1)
         images = torch.tensor(np.array(images))
@@ -480,41 +558,48 @@ def make_rgb_color_match_loss(target, n_colors, keep_ratios=True, ignore_sat_sca
         display.display(TF.to_pil_image(grid))
         return
 
+    def adjust_saturation(sample, saturation_factor):
+        # as in torchvision.transforms.functional.adjust_saturation, but for tensors with values from -1,1
+        return blend(sample, TF.rgb_to_grayscale(sample), saturation_factor)
+
     def blend(img1, img2, ratio):
         return (ratio * img1 + (1.0 - ratio) * img2).clamp(-1, 1).to(img1.dtype)
 
-    def adjust_saturation(sample, saturation_factor):
-        # as in torchvision.transforms.functional.adjust_saturation, but for tensors with values from -1,1
-        # TF.adjust_saturation(sample.add(1).div(2).clamp(0, 1), saturation_factor)   
+    def get_color_palette(n_colors, target):
+        # Create color palette
+        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
+        color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
+        display_color_palette(color_list)
+        # Get ratio of each color class in the target image
+        color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
+        # color_list = color_list[color_indexes]
+        return color_list, color_counts
 
-        return blend(sample, TF.rgb_to_grayscale(sample), saturation_factor)
+    def color_distance_distributions(n_colors, img_shape, color_list, color_counts, n_images=1):
+        # Get the target color distance distributions
+        # Ensure color counts total the amout of pixels in the image
+        n_pixels = img_shape[0]*img_shape[1]
+        color_counts = (color_counts * n_pixels / sum(color_counts)).astype(int)
+        
+        # Make color distances for each color, sorted by distance
+        color_distributions = torch.zeros((n_colors, n_images, n_pixels), device=device)
+        for i_image in range(n_images):
+            for ic,color0 in enumerate(color_list):
+                i_dist = 0
+                for jc,color1 in enumerate(color_list):
+                    color_dist = torch.linalg.norm(color0 - color1)
+                    color_distributions[ic, i_image, i_dist:i_dist+color_counts[jc]] = color_dist
+                    i_dist += color_counts[jc]
+        color_distributions, _ = torch.sort(color_distributions,dim=2)
+        return color_distributions
 
-    # Create color palette
-    kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
-    color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
-    display_color_palette(color_list)
-    # Get ratio of each color class in the target image
-    color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
-    # Order color list from least common to most common (not really necessary)
-    color_counts, color_indexes = zip(*sorted(zip(color_counts, color_indexes)))
-    color_list = color_list[color_indexes]
-
-    def rgb_color_match_loss(x, sigma, **kwargs):
-        min_color_norm_distances = torch.ones(x.shape[0], x.shape[2], x.shape[3]).to(device) * 6.0 # distance to color won't be more than max norm1 distance between -1 and 1 in 3 color dimensions
-        for color in color_list:
-            # Make a tensor of entirely one color
-            color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
-            # Get the color distances
-            if ignore_sat_scale is None:
-                color_distances = torch.linalg.norm(x - color,  dim=1)
-            else:
-                color_distances = torch.linalg.norm(adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
-
-            min_color_norm_distances = torch.minimum(min_color_norm_distances,color_distances)
-
-        return min_color_norm_distances.square().mean()
+    color_list, color_counts = get_color_palette(n_colors, target)
+    color_distributions = None
+    if img_shape is not None:
+        color_distributions = color_distance_distributions(n_colors, img_shape, color_list, color_counts)
 
     def rgb_color_ratio_loss(x, sigma, **kwargs):
+        nonlocal color_distributions
         all_color_norm_distances = torch.ones(len(color_list), x.shape[0], x.shape[2], x.shape[3]).to(device) * 6.0 # distance to color won't be more than max norm1 distance between -1 and 1 in 3 color dimensions
 
         for ic,color in enumerate(color_list):
@@ -532,28 +617,21 @@ def make_rgb_color_match_loss(target, n_colors, keep_ratios=True, ignore_sat_sca
             all_color_norm_distances[ic] = color_distances
         all_color_norm_distances = torch.flatten(all_color_norm_distances,start_dim=2)
 
-        # Get the target color distances
-        color_distribution = torch.zeros(all_color_norm_distances.shape, device=device)
-        for i_image in range(all_color_norm_distances.shape[1]):
-            for ic,color0 in enumerate(color_list):
-                i_dist = 0
-                for jc,color1 in enumerate(color_list):
-                    color_dist = torch.linalg.norm(color0 - color1)
-                    color_distribution[ic,i_image,i_dist:i_dist+color_counts[jc]] = color_dist
-                    i_dist += color_counts[jc]
+        if color_distributions is None:
+            color_distributions = color_distance_distributions(n_colors, 
+                                                               (x.shape[2], x.shape[3]), 
+                                                               color_list, 
+                                                               color_counts, 
+                                                               n_images=x.shape[0])
 
         # Sort the color distances so we can compare them as if they were a cumulative distribution function
-        color_distribution, _ = torch.sort(color_distribution,dim=2)
         all_color_norm_distances, _ = torch.sort(all_color_norm_distances,dim=2)
         
-        color_norm_distribution_diff = all_color_norm_distances - color_distribution
+        color_norm_distribution_diff = all_color_norm_distances - color_distributions
 
         return color_norm_distribution_diff.square().mean()
         
-    if keep_ratios:
-        return rgb_color_match_loss
-    else:
-        return rgb_color_ratio_loss
+    return rgb_color_ratio_loss
 
 
 ###
@@ -757,46 +835,6 @@ def transform_image_3d(prev_img_cv2, depth_tensor, rot_mat, translate, anim_args
     ).cpu().numpy().astype(prev_img_cv2.dtype)
     return result
 
-
-## CLIP -----------------------------------------
-
-class MakeCutouts(nn.Module):
-    def __init__(self, cut_size, cutn, cut_pow=1.):
-        super().__init__()
-        self.cut_size = cut_size
-        self.cutn = cutn
-        self.cut_pow = cut_pow
-
-    def forward(self, input):
-        sideY, sideX = input.shape[2:4]
-        max_size = min(sideX, sideY)
-        min_size = min(sideX, sideY, self.cut_size)
-        cutouts = []
-        for _ in range(self.cutn):
-            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
-            offsetx = torch.randint(0, sideX - size + 1, ())
-            offsety = torch.randint(0, sideY - size + 1, ())
-            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
-            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
-        return torch.cat(cutouts)
-
-
-def spherical_dist_loss(x, y):
-    x = F.normalize(x, dim=-1)
-    y = F.normalize(y, dim=-1)
-    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
-
-
-def clip_loss_fn(x, sigma, **kwargs):
-    clip_in = normalize(make_cutouts(x.add(1).div(2)))
-    image_embeds = clip_model.encode_image(clip_in).float()
-    dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
-    dists = dists.view([cutn, 1, -1])
-    losses = dists.mul(weights).sum(2).mean(0)
-    return losses.sum()
-
-## end CLIP -----------------------------------------
-
 def check_is_number(value):
     float_pattern = r'^(?=.)([+-]?([0-9]*)(\.([0-9]+))?)$'
     return re.match(float_pattern, value)
@@ -997,11 +1035,23 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
     # Loss functions
     mse_loss_fn = make_mse_loss(init_image)
     if args.colormatch_loss_scale != 0:
+        if args.decode_method == "linear":
+            grad_img_shape = (int(args.W/args.f), int(args.H/args.f))
+        else:
+            grad_img_shape = (args.W, args.H)
         color_loss_fn = make_rgb_color_match_loss(colormatch_image, 
                                                   n_colors=args.colormatch_n_colors, 
+                                                  img_shape=grad_img_shape,
                                                   ignore_sat_scale=args.ignore_sat_scale)
     else:
         color_loss_fn = None
+    if args.clip_loss_scale != 0:
+        clip_loss_fn = make_clip_loss_fn(clip_model=clip_model, 
+                                        clip_prompts=clip_prompts, 
+                                        cutn=args.cutn, 
+                                        cut_pow=args.cut_pow)
+    else:
+        clip_loss_fn = None
 
     loss_fns_scales = [
         [clip_loss_fn,              args.clip_loss_scale],
@@ -1489,12 +1539,15 @@ prompts = [
     #"this prompt has weights if prompt weighting enabled:2 can also do negative:-2", # (see prompt_weighting)
 ]
 
+clip_prompts = ['hyperdetailed matte illustration geometric pattern']
+
 animation_prompts = {
     0: "a beautiful apple, trending on Artstation",
     20: "a beautiful banana, trending on Artstation",
     30: "a beautiful coconut, trending on Artstation",
     40: "a beautiful durian, trending on Artstation",
 }
+
 
 # %%
 # !! {"metadata":{
@@ -1503,63 +1556,6 @@ animation_prompts = {
 """
 # Run
 """
-
-# %%
-# !! {"metadata":{
-# !!   "id": "2ibI5xBo-HZs"
-# !! }}
-import clip
-from torchvision import transforms
-from torch.nn import functional as F
-
-# %%
-# !! {"metadata":{
-# !!   "id": "yZEhWtuC9saB"
-# !! }}
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-print('Using device:', device)
-
-clip_name = 'ViT-L/14' # 'ViT-L/14@336px' #'ViT-B/16' #
-clip_model = clip.load(clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
-clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
-normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                 std=[0.26862954, 0.26130258, 0.27577711])
-
-# %%
-# !! {"metadata":{
-# !!   "id": "5AFKxKKM9wKS"
-# !! }}
-cutn = 1
-cut_pow = 0.0001
-
-def parse_prompt(prompt):
-    if prompt.startswith('http://') or prompt.startswith('https://'):
-        vals = prompt.rsplit(':', 2)
-        vals = [vals[0] + ':' + vals[1], *vals[2:]]
-    else:
-        vals = prompt.rsplit(':', 1)
-    vals = vals + ['', '1'][len(vals):]
-    return vals[0], float(vals[1])
-
-clip_prompts = ['hyperdetailed matte illustration geometric pattern']
-
-target_embeds, weights = [], []
-
-for prompt in clip_prompts:
-    txt, weight = parse_prompt(prompt)
-    target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(device)).float())
-    weights.append(weight)
-
-cutout_size = clip_size
-
-make_cutouts = MakeCutouts(cutout_size, cutn, cut_pow)
-
-target_embeds = torch.cat(target_embeds)
-weights = torch.tensor(weights, device=device)
-if weights.sum().abs() < 1e-3:
-    raise RuntimeError('The weights must not sum to 0.')
-weights /= weights.sum().abs()
-
 
 # %%
 # !! {"metadata":{
@@ -1628,20 +1624,23 @@ def DeforumArgs():
     blue_loss_scale = 0 #@param {type:"number"}
     init_mse_scale = 0 #@param {type:"number"}
     clip_loss_scale = 0 #@param {type:"number"}
+    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16']
+    cutn = 1 #@param {type:"number"}
+    cut_pow = 0.0001 #@param {type:"number"}
 
     colormatch_loss_scale = 800 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
-    clamp_grad_threshold = 0.2 #@param {type:"number"}
+    clamp_grad_threshold = 0.1 #@param {type:"number"}
     ignore_sat_scale = 5 #@param 
 
     grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
     gradient_wrt = 'x' #@param ["x", "x0_pred"]
-    gradient_add_to = 'cond' #@param ["cond", "uncond", "both"]
+    gradient_add_to = 'both' #@param ["cond", "uncond", "both"]
     decode_method = 'linear' #@param ["autoencoder","linear"]
 
     #@markdown **Speed vs VRAM Settings**
-    cond_uncond_sync = False #@param {type:"boolean"}
+    cond_uncond_sync = True #@param {type:"boolean"}
 
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
@@ -2127,6 +2126,10 @@ if anim_args.animation_mode == 'None':
     anim_args.max_frames = 1
 elif anim_args.animation_mode == 'Video Input':
     args.use_init = True
+
+# Load clip model if using clip guidance
+if args.clip_loss_scale > 0:
+    clip_model = clip.load(args.clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
 
 # clean up unused memory
 gc.collect()
