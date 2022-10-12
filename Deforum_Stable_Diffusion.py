@@ -606,7 +606,7 @@ def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None, img_shape
             # Make a tensor of entirely one color
             color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
             # Get the color distances
-            if ignore_sat_scale is None or ignore_sat_scale == 0:
+            if ignore_sat_scale is None:
                 # Simple color distance
                 color_distances = torch.linalg.norm(x - color,  dim=1)
             else:
