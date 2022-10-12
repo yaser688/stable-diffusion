@@ -10,13 +10,10 @@
     <a href="https://replicate.com/deforum/deforum_stable_diffusion"><img alt="Replicate" src="https://replicate.com/deforum/deforum_stable_diffusion/badge"></a>
 </p>
 
-## Before Starting
+## Getting Started
 1. install anaconda for managing python environments and packages https://www.anaconda.com/
 2. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
 3. open a conda powershell (on Windows) or terminal (Linux)
-
-
-## Getting Started
 4. clone the github repository:
 ```
 git clone -b local https://github.com/deforum/stable-diffusion.git
@@ -40,6 +37,16 @@ python -m pip install -r requirements.txt
 python Deforum_Stable_Diffusion.py
 
 ```
+
+
+## Starting Over
+the stable-diffusion folder can be deleted and the dsd conda environment can be removed with the following set of commands:
+```
+conda deactivate
+conda env remove -n dsd
+
+```
+with the dsd environment removed you can start over.
 
 
 ## Running Locally
@@ -133,12 +140,3 @@ mv src/ldm/modules/attention.py src/ldm/modules/attention_xformers.py
 mv src/ldm/modules/attention_backup.py src/ldm/modules/attention.py
 
 ```
-
-## Starting Over
-the stable-diffusion folder can be deleted and the dsd conda environment can be removed with the following set of commands:
-```
-conda deactivate
-conda env remove -n dsd
-
-```
-with the dsd environment removed you can start over.
