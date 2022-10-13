@@ -537,6 +537,25 @@ def make_mse_loss(target):
         return (x - target).square().mean()
     return mse_loss
 
+def get_color_palette(n_colors, target, verbose=False):
+    def display_color_palette(color_list):
+        # Expand to 64x64 grid of single color pixels
+        images = color_list.unsqueeze(2).repeat(1,1,64).unsqueeze(3).repeat(1,1,1,64)
+        images = images.double().cpu().add(1).div(2).clamp(0, 1)
+        images = torch.tensor(np.array(images))
+        grid = make_grid(images, 8).cpu()
+        display.display(TF.to_pil_image(grid))
+        return
+
+    # Create color palette
+    kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
+    color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
+    if verbose:
+        display_color_palette(color_list)
+    # Get ratio of each color class in the target image
+    color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
+    # color_list = color_list[color_indexes]
+    return color_list, color_counts
 
 def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None, img_shape=None, device='cuda:0'):
     """
@@ -549,31 +568,12 @@ def make_rgb_color_match_loss(target, n_colors, ignore_sat_scale=None, img_shape
     """
     assert n_colors > 0, "Must use at least one color with color match loss"
 
-    def display_color_palette(color_list):
-        # Expand to 64x64 grid of single color pixels
-        images = color_list.unsqueeze(2).repeat(1,1,64).unsqueeze(3).repeat(1,1,1,64)
-        images = images.double().cpu().add(1).div(2).clamp(0, 1)
-        images = torch.tensor(np.array(images))
-        grid = make_grid(images, 8).cpu()
-        display.display(TF.to_pil_image(grid))
-        return
-
     def adjust_saturation(sample, saturation_factor):
         # as in torchvision.transforms.functional.adjust_saturation, but for tensors with values from -1,1
         return blend(sample, TF.rgb_to_grayscale(sample), saturation_factor)
 
     def blend(img1, img2, ratio):
         return (ratio * img1 + (1.0 - ratio) * img2).clamp(-1, 1).to(img1.dtype)
-
-    def get_color_palette(n_colors, target):
-        # Create color palette
-        kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(torch.flatten(target[0],1,2).T.cpu().numpy())
-        color_list = torch.Tensor(kmeans.cluster_centers_).to(device)
-        display_color_palette(color_list)
-        # Get ratio of each color class in the target image
-        color_indexes, color_counts = np.unique(kmeans.labels_, return_counts=True)
-        # color_list = color_list[color_indexes]
-        return color_list, color_counts
 
     def color_distance_distributions(n_colors, img_shape, color_list, color_counts, n_images=1):
         # Get the target color distance distributions
@@ -654,7 +654,6 @@ def threshold_by(threshold, threshold_type):
   def mean_thresholding(vals, sigma): # Thresholding that appears in Jax and Disco
       magnitude = vals.square().mean(axis=(1,2,3),keepdims=True).sqrt()
       vals = vals * torch.where(magnitude > threshold, threshold / magnitude, 1.0)
-      # vals = static_thresholding(vals, sigma)
       return vals
 
   if threshold_type == 'dynamic':
@@ -1026,7 +1025,7 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
 
     if args.colormatch_loss_scale != 0:
         assert args.colormatch_image is not None, "If using color match loss, colormatch_image is needed"
-        colormatch_image, _ = load_img(args.colormatch_image, shape=(64,64))
+        colormatch_image, _ = load_img(args.colormatch_image)
         colormatch_image = colormatch_image.to('cpu')
         del(_)
     else:
@@ -1035,8 +1034,11 @@ def generate(args, frame = 0, return_latent=False, return_sample=False, return_c
     # Loss functions
     mse_loss_fn = make_mse_loss(init_image)
     if args.colormatch_loss_scale != 0:
+        _,_ = get_color_palette(args.colormatch_n_colors, colormatch_image, verbose=True) # display target color palette outside the latent space
         if args.decode_method == "linear":
             grad_img_shape = (int(args.W/args.f), int(args.H/args.f))
+            colormatch_image = model.linear_decode(model.get_first_stage_encoding(model.encode_first_stage(colormatch_image.to(device))))
+            colormatch_image = colormatch_image.to('cpu')
         else:
             grad_img_shape = (args.W, args.H)
         color_loss_fn = make_rgb_color_match_loss(colormatch_image, 
