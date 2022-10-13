@@ -37,6 +37,8 @@ python -m pip install -r requirements.txt
 python Deforum_Stable_Diffusion.py
 
 ```
+you have successfully installed deforum stable diffusion if the python file runs without any errors. if you get "out of memory" errors you can try installing xformers for your system (see either Windows Users or Linux Users below).
+
 
 ## Running Deforum Stable Diffusion
 there are four ways to run deforum stable diffusion: locally with the .py file, locally with jupyter, locally through colab, and on colab severs.
