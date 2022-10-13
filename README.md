@@ -38,18 +38,10 @@ python Deforum_Stable_Diffusion.py
 
 ```
 
+## Running Deforum Stable Diffusion
+there are four ways to run deforum stable diffusion: locally with the .py file, locally with jupyter, locally through colab, and on colab severs.
 
-## Starting Over
-the stable-diffusion folder can be deleted and the dsd conda environment can be removed with the following set of commands:
-```
-conda deactivate
-conda env remove -n dsd
-
-```
-with the dsd environment removed you can start over.
-
-
-## Running Locally
+### Running Locally
 make sure the dsd conda environment is active:
 ```
 conda activate dsd
@@ -71,7 +63,7 @@ jupyter notebook
 ```
 
 
-## Colab Local Runtime
+### Colab Local Runtime
 make sure the dsd conda environment is active:
 ```
 conda activate dsd
@@ -90,7 +82,7 @@ jupyter notebook --NotebookApp.allow_origin='https://colab.research.google.com' 
 copy paste url token.
 
 
-## Colab Hosted Runtime
+### Colab Hosted Runtime
 Deforum_Stable_Diffusion.ipynb can be uploaded to colab and run normally in a hosted session.
 
 
@@ -140,3 +132,13 @@ mv src/ldm/modules/attention.py src/ldm/modules/attention_xformers.py
 mv src/ldm/modules/attention_backup.py src/ldm/modules/attention.py
 
 ```
+
+
+## Starting Over
+the stable-diffusion folder can be deleted and the dsd conda environment can be removed with the following set of commands:
+```
+conda deactivate
+conda env remove -n dsd
+
+```
+with the dsd environment removed you can start over.
