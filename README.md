@@ -13,26 +13,31 @@
 ## Getting Started
 1. install anaconda for managing python environments and packages https://www.anaconda.com/
 2. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
-3. open a conda powershell (on Windows) or terminal (Linux)
-4. clone the github repository:
+3. open a anaconda powershell (on Windows) or terminal (Linux)
+4. install git through anaconda
+```
+conda install -c anaconda git -y
+
+```
+5. clone the github repository:
 ```
 git clone -b local https://github.com/deforum/stable-diffusion.git
 cd stable-diffusion
 
 ```
-5. create anaconda environment:
+6. create anaconda environment:
 ```
 conda create -n dsd python=3.9 -y
 conda activate dsd
 conda install pytorch cudatoolkit=11.6 torchvision torchaudio -c pytorch -c conda-forge -y
 
 ```
-6. install required packages:
+7. install required packages:
 ```
 python -m pip install -r requirements.txt
 
 ```
-7. check your installation by running the .py
+8. check your installation by running the .py
 ```
 python Deforum_Stable_Diffusion.py
 
