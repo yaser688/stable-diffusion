@@ -14,7 +14,7 @@
 1. install anaconda for managing python environments and packages https://www.anaconda.com/
 2. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
 3. open a anaconda powershell (on Windows) or terminal (Linux)
-4. install git through anaconda
+4. install git through anaconda:
 ```
 conda install -c anaconda git -y
 
