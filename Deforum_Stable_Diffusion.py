@@ -124,10 +124,13 @@ import gc
 import time
 import random
 from types import SimpleNamespace
+import clip
+from IPython import display
 
 from helpers.save_images import get_output_folder
 from helpers.settings import load_args
 from helpers.render import render_animation, render_input_video, render_image_batch, render_interpolation
+from helpers.model_load import make_linear_decode
 
 #@markdown **Select and Load Model**
 
@@ -309,6 +312,9 @@ def load_model():
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         model = model.to(device)
 
+    autoencoder_version = "sd-v1" #TODO this will be different for different models
+    model.linear_decode = make_linear_decode(autoencoder_version, device)
+
     return model, device
 
 model, device = load_model()
@@ -403,6 +409,8 @@ def DeforumAnimArgs():
 # !! {"metadata":{
 # !!   "id": "2ujwkGZTcGev"
 # !! }}
+clip_prompts = ['hyperdetailed matte illustration geometric pattern']
+
 prompts = [
     "a beautiful lake by Asher Brown Durand, trending on Artstation", # the first prompt I want
     "a beautiful portrait of a woman by Artgerm, trending on Artstation", # the second prompt I want
@@ -493,6 +501,28 @@ def DeforumArgs():
     # Blur edges of final overlay mask, if used. Minimum = 0 (no blur)
     mask_overlay_blur = 5 # {type:"number"}
 
+    #@markdown **Conditioning Settings**
+    blue_loss_scale = 0
+    init_mse_scale = 0 #@param {type:"number"}
+    clip_loss_scale = 0 #@param {type:"number"}
+    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16']
+    cutn = 1 #@param {type:"number"}
+    cut_pow = 0.0001 #@param {type:"number"}
+
+    colormatch_loss_scale = 800 #@param {type:"number"}
+    colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
+    colormatch_n_colors = 4 #@param {type:"number"}
+    clamp_grad_threshold = 0.1 #@param {type:"number"}
+    ignore_sat_scale = 5 #@param 
+
+    grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
+    gradient_wrt = 'x' #@param ["x", "x0_pred"]
+    gradient_add_to = 'both' #@param ["cond", "uncond", "both"]
+    decode_method = 'linear' #@param ["autoencoder","linear"]
+
+    #@markdown **Speed vs VRAM Settings**
+    cond_uncond_sync = True #@param {type:"boolean"}
+
     n_samples = 1 # doesnt do anything
     precision = 'autocast' 
     C = 4
@@ -519,6 +549,10 @@ anim_args = SimpleNamespace(**anim_args_dict)
 
 args.timestring = time.strftime('%Y%m%d%H%M%S')
 args.strength = max(0.0, min(1.0, args.strength))
+
+# Load clip model if using clip guidance
+if args.clip_loss_scale > 0:
+    root.clip_model = clip.load(args.clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
 
 root.model = model
 root.device = device
@@ -629,7 +663,7 @@ else:
 
     mp4 = open(mp4_path,'rb').read()
     data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
-    display.display( display.HTML(f'<video controls loop><source src="{data_url}" type="video/mp4"></video>') )
+    display.display(display.HTML(f'<video controls loop><source src="{data_url}" type="video/mp4"></video>') )
 
 # %%
 # !! {"metadata":{
