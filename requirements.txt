@@ -17,6 +17,7 @@ pandas
 pytorch_lightning
 resize-right
 scikit-image
+scikit-learn
 timm
 torchdiffeq
 transformers==4.19.2
