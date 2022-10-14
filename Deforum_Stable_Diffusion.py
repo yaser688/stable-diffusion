@@ -404,7 +404,7 @@ def DeforumAnimArgs():
 # !!   "id": "2ujwkGZTcGev"
 # !! }}
 prompts = [
-    "a beautiful forest by Asher Brown Durand, trending on Artstation", # the first prompt I want
+    "a beautiful lake by Asher Brown Durand, trending on Artstation", # the first prompt I want
     "a beautiful portrait of a woman by Artgerm, trending on Artstation", # the second prompt I want
     #"this prompt I don't want it I commented it out",
     #"a nousr robot, trending on Artstation", # use "nousr robot" with the robot diffusion model (see model_checkpoint setting)
