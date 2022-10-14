@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import torch
 import torchvision.transforms as T
+import requests
 
 from einops import rearrange, repeat
 from PIL import Image
@@ -14,7 +15,24 @@ import torchvision.transforms.functional as TF
 
 
 def wget(url, outputdir):
-    print(subprocess.run(['wget', url, '-P', outputdir], stdout=subprocess.PIPE).stdout.decode('utf-8'))
+    filename = url.split("/")[-1]
+
+    ckpt_request = requests.get(url)
+    request_status = ckpt_request.status_code
+
+    # inform user of errors
+    if request_status == 403:
+        raise ConnectionRefusedError("You have not accepted the license for this model.")
+    elif request_status == 404:
+        raise ConnectionError("Could not make contact with server")
+    elif request_status != 200:
+        raise ConnectionError(f"Some other error has ocurred - response code: {request_status}")
+
+    # write to model path
+    with open(os.path.join(outputdir, filename), 'wb') as model_file:
+        model_file.write(ckpt_request.content)
+
+    #print(subprocess.run(['wget', url, '-P', outputdir], stdout=subprocess.PIPE).stdout.decode('utf-8'))
 
 
 class DepthModel():
