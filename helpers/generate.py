@@ -18,10 +18,13 @@ from scipy.ndimage import gaussian_filter
 
 from .callback import SamplerCallback
 
+from .conditioning import make_mse_loss, get_color_palette, make_clip_loss_fn, make_rgb_color_match_loss, blue_loss_fn, threshold_by
+from .model_wrap import CFGDenoiserWithGrad
+
 def add_noise(sample: torch.Tensor, noise_amt: float) -> torch.Tensor:
     return sample + torch.randn(sample.shape, device=sample.device) * noise_amt
 
-def load_img(path, shape, use_alpha_as_mask=False):
+def load_img(path, shape=None, use_alpha_as_mask=False):
     # use_alpha_as_mask: Read the alpha channel of the image as the mask image
     if path.startswith('http://') or path.startswith('https://'):
         image = Image.open(requests.get(path, stream=True).raw)
@@ -33,7 +36,8 @@ def load_img(path, shape, use_alpha_as_mask=False):
     else:
         image = image.convert('RGB')
 
-    image = image.resize(shape, resample=Image.LANCZOS)
+    if shape is not None:
+        image = image.resize(shape, resample=Image.LANCZOS)
 
     mask_image = None
     if use_alpha_as_mask:
@@ -162,13 +166,64 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
+    if args.colormatch_loss_scale != 0:
+        assert args.colormatch_image is not None, "If using color match loss, colormatch_image is needed"
+        colormatch_image, _ = load_img(args.colormatch_image)
+        colormatch_image = colormatch_image.to('cpu')
+        del(_)
+    else:
+        colormatch_image = None
+
+    # Loss functions
+    mse_loss_fn = make_mse_loss(init_image)
+    if args.colormatch_loss_scale != 0:
+        _,_ = get_color_palette(root, args.colormatch_n_colors, colormatch_image, verbose=True) # display target color palette outside the latent space
+        if args.decode_method == "linear":
+            grad_img_shape = (int(args.W/args.f), int(args.H/args.f))
+            colormatch_image = root.model.linear_decode(root.model.get_first_stage_encoding(root.model.encode_first_stage(colormatch_image.to(root.device))))
+            colormatch_image = colormatch_image.to('cpu')
+        else:
+            grad_img_shape = (args.W, args.H)
+        color_loss_fn = make_rgb_color_match_loss(root,
+                                                  colormatch_image, 
+                                                  n_colors=args.colormatch_n_colors, 
+                                                  img_shape=grad_img_shape,
+                                                  ignore_sat_scale=args.ignore_sat_scale)
+    else:
+        color_loss_fn = None
+    if args.clip_loss_scale != 0:
+        clip_loss_fn = make_clip_loss_fn(clip_model=root.clip_model, 
+                                        clip_prompts=root.clip_prompts, 
+                                        cutn=args.cutn, 
+                                        cut_pow=args.cut_pow)
+    else:
+        clip_loss_fn = None
+
+    loss_fns_scales = [
+        [clip_loss_fn,              args.clip_loss_scale],
+        [blue_loss_fn,              args.blue_loss_scale],
+        [mse_loss_fn,               args.init_mse_scale],
+        [color_loss_fn,             args.colormatch_loss_scale],
+    ]
+
     callback = SamplerCallback(args=args,
                             root=root,
                             mask=mask, 
                             init_latent=init_latent,
                             sigmas=k_sigmas,
                             sampler=sampler,
-                            verbose=False).callback  
+                            verbose=False).callback 
+
+    clamp_fn = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+
+    cfg_model = CFGDenoiserWithGrad(model_wrap, 
+                                    loss_fns_scales, 
+                                    clamp_fn, 
+                                    args.gradient_wrt, 
+                                    args.gradient_add_to, 
+                                    args.cond_uncond_sync,
+                                    decode_method=args.decode_method,
+                                    verbose=False)
 
     results = []
     with torch.no_grad():
@@ -194,11 +249,12 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
                             c=c, 
                             uc=uc, 
                             args=args, 
-                            model_wrap=model_wrap, 
+                            model_wrap=cfg_model, 
                             init_latent=init_latent, 
                             t_enc=t_enc, 
                             device=root.device, 
-                            cb=callback)
+                            cb=callback,
+                            verbose=False)
                     else:
                         # args.sampler == 'plms' or args.sampler == 'ddim':
                         if init_latent is not None and args.strength > 0:

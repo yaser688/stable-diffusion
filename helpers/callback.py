@@ -22,7 +22,6 @@ class SamplerCallback(object):
         self.sigmas = sigmas
         self.sampler = sampler
         self.verbose = verbose
-
         self.batch_size = args.n_samples
         self.save_sample_per_step = args.save_sample_per_step
         self.show_sample_per_step = args.show_sample_per_step
@@ -57,26 +56,27 @@ class SamplerCallback(object):
 
         self.verbose_print = print if verbose else lambda *args, **kwargs: None
 
-    def view_sample_step(self, latents, path_name_modifier=''):
-        if self.save_sample_per_step or self.show_sample_per_step:
-            samples = self.model.decode_first_stage(latents)
-            if self.save_sample_per_step:
-                fname = f'{path_name_modifier}_{self.step_index:05}.png'
-                for i, sample in enumerate(samples):
-                    sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
-                    sample = torch.tensor(np.array(sample))
-                    grid = make_grid(sample, 4).cpu()
-                    TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
-            if self.show_sample_per_step:
-                print(path_name_modifier)
-                self.display_images(samples)
-        return
-
     def display_images(self, images):
         images = images.double().cpu().add(1).div(2).clamp(0, 1)
         images = torch.tensor(np.array(images))
         grid = make_grid(images, 4).cpu()
+        display.clear_output(wait=True)
         display.display(TF.to_pil_image(grid))
+        return
+
+    def view_sample_step(self, latents, path_name_modifier=''):
+        if self.save_sample_per_step:
+            samples = self.model.decode_first_stage(latents)
+            fname = f'{path_name_modifier}_{self.step_index:05}.png'
+            for i, sample in enumerate(samples):
+                sample = sample.double().cpu().add(1).div(2).clamp(0, 1)
+                sample = torch.tensor(np.array(sample))
+                grid = make_grid(sample, 4).cpu()
+                TF.to_pil_image(grid).save(os.path.join(self.paths_to_image_steps[i], fname))
+        if self.show_sample_per_step:
+            samples = self.model.linear_decode(latents)
+            print(path_name_modifier)
+            self.display_images(samples)
         return
 
     # The callback function is applied to the image at each step
@@ -102,10 +102,11 @@ class SamplerCallback(object):
             args_dict['x'].copy_(new_img)
 
         self.view_sample_step(args_dict['denoised'], "x0_pred")
+        self.view_sample_step(args_dict['x'], "x")
 
     # Callback for Compvis samplers
     # Function that is called on the image (img) and step (i) at each step
-    def img_callback_(self, img, i):
+    def img_callback_(self, img, pred_x0, i):
         self.step_index = i
         # Thresholding functions
         if self.dynamic_threshold is not None:
@@ -119,4 +120,5 @@ class SamplerCallback(object):
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
 
+        self.view_sample_step(pred_x0, "x0_pred")
         self.view_sample_step(img, "x")

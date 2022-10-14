@@ -1,20 +1,7 @@
 from typing import Any, Callable, Optional
-import torch
 from k_diffusion.external import CompVisDenoiser
 from k_diffusion import sampling
-from torch import nn
-
-class CFGDenoiser(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.inner_model = model
-
-    def forward(self, x, sigma, uncond, cond, cond_scale):
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, cond])
-        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
-        return uncond + (cond - uncond) * cond_scale
+import torch
 
 
 def sampler_fn(
@@ -28,6 +15,7 @@ def sampler_fn(
     if not torch.cuda.is_available()
     else torch.device("cuda"),
     cb: Callable[[Any], None] = None,
+    verbose: Optional[bool] = False,
 ) -> torch.Tensor:
     shape = [args.C, args.H // args.f, args.W // args.f]
     sigmas: torch.Tensor = model_wrap.get_sigmas(args.steps)
@@ -46,7 +34,7 @@ def sampler_fn(
         else:
             x = torch.zeros([args.n_samples, *shape], device=device)
     sampler_args = {
-        "model": CFGDenoiser(model_wrap),
+        "model": model_wrap,
         "x": x,
         "sigmas": sigmas,
         "extra_args": {"cond": c, "uncond": uc, "cond_scale": args.scale},
