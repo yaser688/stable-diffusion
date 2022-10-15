@@ -11,33 +11,34 @@
 </p>
 
 ## Getting Started
-1. install anaconda for managing python environments and packages https://www.anaconda.com/
-2. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
-3. open a anaconda powershell (on Windows) or terminal (Linux)
-4. install git through anaconda:
+1. make sure you have the latest nvidia drivers https://developer.nvidia.com/cuda-downloads
+2. install anaconda for managing python environments and packages https://www.anaconda.com/
+3. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
+4. open a anaconda powershell (on Windows) or terminal (Linux)
+5. install git through anaconda:
 ```
 conda install -c anaconda git -y
 
 ```
-5. clone the github repository:
+6. clone the github repository:
 ```
 git clone -b local-conditioning https://github.com/deforum/stable-diffusion.git
 cd stable-diffusion
 
 ```
-6. create anaconda environment:
+7. create anaconda environment:
 ```
 conda create -n dsd python=3.9 -y
 conda activate dsd
 conda install pytorch cudatoolkit=11.6 torchvision torchaudio -c pytorch -c conda-forge -y
 
 ```
-7. install required packages:
+8. install required packages:
 ```
 python -m pip install -r requirements.txt
 
 ```
-8. check your installation by running the .py
+9. check your installation by running the .py
 ```
 python Deforum_Stable_Diffusion.py
 
