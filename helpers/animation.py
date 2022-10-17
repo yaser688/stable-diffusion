@@ -32,10 +32,10 @@ def construct_RotationMatrixHomogenous(rotation_angles):
     cv2.Rodrigues(np.array(rotation_angles), RH[0:3, 0:3])
     return RH
 
-def vid2frames(video_path, frames_path, video_in_frame_path, n=1, overwrite=True):      
+def vid2frames(video_path, frames_path, n=1, overwrite=True):      
     if not os.path.exists(frames_path) or overwrite: 
         try:
-            for f in pathlib.Path(video_in_frame_path).glob('*.jpg'):
+            for f in pathlib.Path(frames_path).glob('*.jpg'):
                 f.unlink()
         except:
             pass

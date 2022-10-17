@@ -18,7 +18,7 @@ from scipy.ndimage import gaussian_filter
 
 from .callback import SamplerCallback
 
-from .conditioning import make_mse_loss, get_color_palette, make_clip_loss_fn, make_rgb_color_match_loss, blue_loss_fn, threshold_by
+from .conditioning import make_mse_loss, get_color_palette, make_clip_loss_fn, make_rgb_color_match_loss, blue_loss_fn, threshold_by, make_aesthetics_loss_fn
 from .model_wrap import CFGDenoiserWithGrad
 
 def add_noise(sample: torch.Tensor, noise_amt: float) -> torch.Tensor:
@@ -191,19 +191,23 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
                                                   ignore_sat_scale=args.ignore_sat_scale)
     else:
         color_loss_fn = None
+
     if args.clip_loss_scale != 0:
-        clip_loss_fn = make_clip_loss_fn(clip_model=root.clip_model, 
-                                        clip_prompts=root.clip_prompts, 
-                                        cutn=args.cutn, 
-                                        cut_pow=args.cut_pow)
+        clip_loss_fn = make_clip_loss_fn(root, args)
     else:
         clip_loss_fn = None
+
+    if args.aesthetics_loss_scale != 0:
+        aesthetics_loss_fn = make_aesthetics_loss_fn(root, args)
+    else:
+        aesthetics_loss_fn = None
 
     loss_fns_scales = [
         [clip_loss_fn,              args.clip_loss_scale],
         [blue_loss_fn,              args.blue_loss_scale],
         [mse_loss_fn,               args.init_mse_scale],
         [color_loss_fn,             args.colormatch_loss_scale],
+        [aesthetics_loss_fn,        args.aesthetics_loss_scale]
     ]
 
     callback = SamplerCallback(args=args,

@@ -42,8 +42,8 @@ def spherical_dist_loss(x, y):
     y = F.normalize(y, dim=-1)
     return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
 
-def make_clip_loss_fn(root, clip_model, clip_prompts, cutn=1, cut_pow=1):
-    clip_size = clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
+def make_clip_loss_fn(root, args):
+    clip_size = root.clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
 
     def parse_prompt(prompt):
         if prompt.startswith('http://') or prompt.startswith('https://'):
@@ -58,7 +58,7 @@ def make_clip_loss_fn(root, clip_model, clip_prompts, cutn=1, cut_pow=1):
         target_embeds, weights = [], []
         for prompt in clip_prompts:
             txt, weight = parse_prompt(prompt)
-            target_embeds.append(clip_model.encode_text(clip.tokenize(txt).to(root.device)).float())
+            target_embeds.append(root.clip_model.encode_text(clip.tokenize(txt).to(root.device)).float())
             weights.append(weight)
         target_embeds = torch.cat(target_embeds)
         weights = torch.tensor(weights, device=root.device)
@@ -70,19 +70,30 @@ def make_clip_loss_fn(root, clip_model, clip_prompts, cutn=1, cut_pow=1):
     normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                           std=[0.26862954, 0.26130258, 0.27577711])
 
-    make_cutouts = MakeCutouts(clip_size, cutn, cut_pow)
-    target_embeds, weights = parse_clip_prompts(clip_prompts)
+    make_cutouts = MakeCutouts(clip_size, args.cutn, args.cut_pow)
+    target_embeds, weights = parse_clip_prompts(args.clip_prompts)
 
     def clip_loss_fn(x, sigma, **kwargs):
         nonlocal target_embeds, weights, make_cutouts, normalize
         clip_in = normalize(make_cutouts(x.add(1).div(2)))
-        image_embeds = clip_model.encode_image(clip_in).float()
+        image_embeds = root.clip_model.encode_image(clip_in).float()
         dists = spherical_dist_loss(image_embeds[:, None], target_embeds[None])
-        dists = dists.view([cutn, 1, -1])
+        dists = dists.view([args.cutn, 1, -1])
         losses = dists.mul(weights).sum(2).mean(0)
         return losses.sum()
 
     return clip_loss_fn
+
+def make_aesthetics_loss_fn(root,args):
+    clip_size = root.clip_model.visual.input_resolution # for openslip: clip_model.visual.image_size
+
+    def aesthetics_cond_fn(x, sigma, **kwargs):
+        clip_in = F.interpolate(x, (clip_size, clip_size))
+        image_embeds = root.clip_model.encode_image(clip_in).float()
+        losses = (10 - root.aesthetics_model(image_embeds)[0])
+        return losses.sum()
+
+    return aesthetics_cond_fn
 
 ## end CLIP -----------------------------------------
 
