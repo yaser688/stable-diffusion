@@ -161,6 +161,7 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
 
     # Noise schedule for the k-diffusion samplers (used for masking)
     k_sigmas = model_wrap.get_sigmas(args.steps)
+    args.clamp_schedule = dict(zip(k_sigmas.tolist(), np.linspace(args.clamp_start,args.clamp_stop,args.steps+1)))
     k_sigmas = k_sigmas[len(k_sigmas)-t_enc-1:]
 
     if args.sampler in ['plms','ddim']:
@@ -218,7 +219,7 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
                             sampler=sampler,
                             verbose=False).callback 
 
-    clamp_fn = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type)
+    clamp_fn = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type, clamp_schedule=args.clamp_schedule)
 
     cfg_model = CFGDenoiserWithGrad(model_wrap, 
                                     loss_fns_scales, 

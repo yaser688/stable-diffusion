@@ -61,6 +61,7 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
 
     # General denoising model with gradient conditioning
     def cond_model_fn_(self, x, sigma, inner_model=None, **kwargs):
+
         # inner_model: optionally use a different inner_model function or a wrapper function around inner_model, see self.forward._cfg_model
         if inner_model is None:
             inner_model = self.inner_model

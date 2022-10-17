@@ -209,7 +209,7 @@ def make_rgb_color_match_loss(root, target, n_colors, ignore_sat_scale=None, img
 ###
 # Thresholding functions for grad
 ###
-def threshold_by(threshold, threshold_type):
+def threshold_by(threshold, threshold_type, clamp_schedule):
 
   def dynamic_thresholding(vals, sigma):
       # Dynamic thresholding from Imagen paper (May 2022)
@@ -228,11 +228,20 @@ def threshold_by(threshold, threshold_type):
       vals = vals * torch.where(magnitude > threshold, threshold / magnitude, 1.0)
       return vals
 
+  def scheduling(vals, sigma):
+      clamp_val = clamp_schedule[sigma.item()]
+      magnitude = vals.square().mean().sqrt()
+      vals = vals * magnitude.clamp(max=clamp_val) / magnitude
+      #print(clamp_val)
+      return vals
+
   if threshold_type == 'dynamic':
       return dynamic_thresholding
   elif threshold_type == 'static':
       return static_thresholding
   elif threshold_type == 'mean':
       return mean_thresholding
+  elif threshold_type == 'schedule':
+      return scheduling
   else:
       raise Exception(f"Thresholding type {threshold_type} not supported")
