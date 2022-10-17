@@ -131,6 +131,7 @@ from helpers.save_images import get_output_folder
 from helpers.settings import load_args
 from helpers.render import render_animation, render_input_video, render_image_batch, render_interpolation
 from helpers.model_load import make_linear_decode
+from helpers.aesthetics import load_aesthetics_model
 
 #@markdown **Select and Load Model**
 
@@ -502,14 +503,16 @@ def DeforumArgs():
     mask_overlay_blur = 5 # {type:"number"}
 
     #@markdown **Conditioning Settings**
-    blue_loss_scale = 0
     init_mse_scale = 0 #@param {type:"number"}
+    blue_loss_scale = 0
+
     clip_loss_scale = 0 #@param {type:"number"}
+    aesthetics_loss_scale = 8 #@param {type:"number"}
     clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16']
     cutn = 1 #@param {type:"number"}
     cut_pow = 0.0001 #@param {type:"number"}
 
-    colormatch_loss_scale = 800 #@param {type:"number"}
+    colormatch_loss_scale = 0 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
     clamp_grad_threshold = 0.1 #@param {type:"number"}
@@ -550,15 +553,17 @@ anim_args = SimpleNamespace(**anim_args_dict)
 args.timestring = time.strftime('%Y%m%d%H%M%S')
 args.strength = max(0.0, min(1.0, args.strength))
 
-# Load clip model if using clip guidance
-if args.clip_loss_scale > 0:
-    root.clip_model = clip.load(args.clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
-
 root.model = model
 root.device = device
 root.models_path = models_path
 root.output_path = output_path
 root.half_precision = True
+
+# Load clip model if using clip guidance
+if (args.clip_loss_scale > 0) or (args.aesthetics_loss_scale > 0):
+    root.clip_model = clip.load(args.clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
+    if (args.aesthetics_loss_scale > 0):
+        root.aesthetics_model = load_aesthetics_model(args, root)
 
 if args.seed == -1:
     args.seed = random.randint(0, 2**32 - 1)
@@ -587,7 +592,7 @@ elif anim_args.animation_mode == 'Video Input':
 elif anim_args.animation_mode == 'Interpolation':
     render_interpolation(args, anim_args, animation_prompts, root)
 else:
-    render_image_batch(args, prompts, root)    
+    render_image_batch(args, prompts, root)
 
 # %%
 # !! {"metadata":{
@@ -671,7 +676,6 @@ else:
 # !! }}
 """
 # Disconnect when finished
-
 """
 
 # %%
@@ -697,7 +701,7 @@ else:
 # !!   },
 # !!   "gpuClass": "standard",
 # !!   "kernelspec": {
-# !!     "display_name": "Python 3 (ipykernel)",
+# !!     "display_name": "Python 3.9.13 ('dsd')",
 # !!     "language": "python",
 # !!     "name": "python3"
 # !!   },
@@ -712,5 +716,10 @@ else:
 # !!     "nbconvert_exporter": "python",
 # !!     "pygments_lexer": "ipython3",
 # !!     "version": "3.9.13"
+# !!   },
+# !!   "vscode": {
+# !!     "interpreter": {
+# !!       "hash": "b7e04c8a9537645cbc77fa0cbde8069bc94e341b0d5ced104651213865b24e58"
+# !!     }
 # !!   }
 # !! }}
