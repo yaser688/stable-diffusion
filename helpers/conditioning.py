@@ -109,6 +109,13 @@ def make_mse_loss(target):
         return (x - target).square().mean()
     return mse_loss
 
+# MSE loss from init
+def exposure_loss(target):
+    def exposure_loss_fn(x, sigma, **kwargs):
+        error = torch.abs(x-target).mean()
+        return error
+    return exposure_loss_fn
+
 def mean_loss_fn(x, sigma, **kwargs):
   error = torch.abs(x).mean() 
   return error
