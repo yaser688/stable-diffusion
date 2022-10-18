@@ -89,7 +89,7 @@ def setup_environment():
         all_process = [
             ['pip', 'install', 'torch==1.12.1+cu113', 'torchvision==0.13.1+cu113', '--extra-index-url', 'https://download.pytorch.org/whl/cu113'],
             ['pip', 'install', 'omegaconf==2.2.3', 'einops==0.4.1', 'pytorch-lightning==1.7.4', 'torchmetrics==0.9.3', 'torchtext==0.13.1', 'transformers==4.21.2', 'kornia==0.6.7'],
-            ['git', 'clone',  '-b', 'local', 'https://github.com/deforum/stable-diffusion'],
+            ['git', 'clone',  '-b', 'local-conditioning', 'https://github.com/deforum/stable-diffusion'],
             ['pip', 'install', 'accelerate', 'ftfy', 'jsonmerge', 'matplotlib', 'resize-right', 'timm', 'torchdiffeq','scikit-learn'],
         ]
         for process in all_process:
@@ -411,7 +411,7 @@ def DeforumAnimArgs():
 # !!   "id": "2ujwkGZTcGev"
 # !! }}
 prompts = [
-    "a beautiful lake by Asher Brown Durand, trending on Artstation", # the first prompt I want
+    "a beautiful forest by Asher Brown Durand, trending on Artstation", # the first prompt I want
     "a beautiful portrait of a woman by Artgerm, trending on Artstation", # the second prompt I want
     #"this prompt I don't want it I commented it out",
     #"a nousr robot, trending on Artstation", # use "nousr robot" with the robot diffusion model (see model_checkpoint setting)
@@ -456,7 +456,7 @@ def DeforumArgs():
     seed = -1 #@param
     sampler = 'euler_ancestral' #@param ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral","plms", "ddim"]
     steps = 80 #@param
-    scale = 12 #@param
+    scale = 7 #@param
     ddim_eta = 0.0 #@param
     dynamic_threshold = None
     static_threshold = None   
@@ -474,7 +474,7 @@ def DeforumArgs():
     log_weighted_subprompts = False #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
-    n_batch = 4 #@param
+    n_batch = 1 #@param
     batch_name = "StableFun" #@param {type:"string"}
     filename_format = "{timestring}_{index}_{prompt}.png" #@param ["{timestring}_{index}_{seed}.png","{timestring}_{index}_{prompt}.png"]
     seed_behavior = "iter" #@param ["iter","fixed","random"]
@@ -502,11 +502,13 @@ def DeforumArgs():
 
     #@markdown **Conditioning Settings**
     init_mse_scale = 0 #@param {type:"number"}
-    blue_loss_scale = 0
-    ignore_sat_scale = 5 #@param 
+    blue_loss_scale = 0 #@param {type:"number"}
+    mean_loss_scale = 0 #@param {type:"number"}
+    var_loss_scale = 0 #@param {type:"number"}
+    ignore_sat_scale = 0 #@param {type:"number"}
 
-    clip_loss_scale = 100 #@param {type:"number"}
-    aesthetics_loss_scale = 10 #@param {type:"number"}
+    clip_loss_scale = 0 #@param {type:"number"}
+    aesthetics_loss_scale = 0 #@param {type:"number"}
     clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
     cutn = 1 #@param {type:"number"}
     cut_pow = 0.0001 #@param {type:"number"}
@@ -515,11 +517,11 @@ def DeforumArgs():
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
     
-    grad_threshold_type = 'schedule' #@param ["dynamic", "static", "mean", "schedule"]
-    clamp_start = 0.10 #@param
+    grad_threshold_type = 'dynamic' #@param ["dynamic", "static", "mean", "schedule"]
+    clamp_start = 0.2 #@param
     clamp_stop = 0.01 #@param
     clamp_grad_threshold = 0.2 #@param {type:"number"}
-    gradient_wrt = 'x' #@param ["x", "x0_pred"]
+    gradient_wrt = 'x0_pred' #@param ["x", "x0_pred"]
     gradient_add_to = 'both' #@param ["cond", "uncond", "both"]
     decode_method = 'linear' #@param ["autoencoder","linear"]
 
