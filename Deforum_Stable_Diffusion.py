@@ -507,6 +507,9 @@ def DeforumArgs():
     var_loss_scale = 0 #@param {type:"number"}
     ignore_sat_scale = 0 #@param {type:"number"}
 
+    exposure_loss_scale = 0 #@param {type:"number"}
+    exposure_target = 0.5 #@param {type:"number"}
+
     clip_loss_scale = 0 #@param {type:"number"}
     aesthetics_loss_scale = 0 #@param {type:"number"}
     clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
