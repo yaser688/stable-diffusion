@@ -109,6 +109,14 @@ def make_mse_loss(target):
         return (x - target).square().mean()
     return mse_loss
 
+def mean_loss_fn(x, sigma, **kwargs):
+  error = torch.abs(x).mean() 
+  return error
+
+def var_loss_fn(x, sigma, **kwargs):
+  error = x.var()
+  return error
+
 def get_color_palette(root, n_colors, target, verbose=False):
     def display_color_palette(color_list):
         # Expand to 64x64 grid of single color pixels
