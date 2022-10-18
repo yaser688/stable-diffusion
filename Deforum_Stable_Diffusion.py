@@ -510,6 +510,7 @@ def DeforumArgs():
     colormatch_loss_scale = 0 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
+    ignore_sat_scale = 0 #@param {type:"number"}
 
     #@markdown **CLIP\Aesthetics Conditional Settings**
     clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
@@ -521,7 +522,6 @@ def DeforumArgs():
     #@markdown **Other Conditional Settings**
     init_mse_scale = 0 #@param {type:"number"}
     blue_loss_scale = 0 #@param {type:"number"}
-    ignore_sat_scale = 0 #@param {type:"number"}
     
     #@markdown **Conditional Gradient Settings**
     gradient_wrt = 'x0_pred' #@param ["x", "x0_pred"]
