@@ -470,7 +470,7 @@ def DeforumArgs():
 
     #@markdown **Prompt Settings**
     prompt_weighting = False #@param {type:"boolean"}
-    normalize_prompt_weights = True #@param {type:"boolean"}
+    normalize_prompt_weights = False #@param {type:"boolean"}
     log_weighted_subprompts = False #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
@@ -500,33 +500,37 @@ def DeforumArgs():
     # Blur edges of final overlay mask, if used. Minimum = 0 (no blur)
     mask_overlay_blur = 5 # {type:"number"}
 
-    #@markdown **Conditioning Settings**
-    init_mse_scale = 0 #@param {type:"number"}
-    blue_loss_scale = 0 #@param {type:"number"}
+    #@markdown **Exposure/Contrast Conditional Settings**
     mean_loss_scale = 0 #@param {type:"number"}
     var_loss_scale = 0 #@param {type:"number"}
-    ignore_sat_scale = 0 #@param {type:"number"}
-
-    exposure_loss_scale = 0 #@param {type:"number"}
+    exposure_loss_scale = 100 #@param {type:"number"}
     exposure_target = 0.5 #@param {type:"number"}
 
-    clip_loss_scale = 0 #@param {type:"number"}
-    aesthetics_loss_scale = 0 #@param {type:"number"}
-    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
-    cutn = 1 #@param {type:"number"}
-    cut_pow = 0.0001 #@param {type:"number"}
-
+    #@markdown **Color Match Conditional Settings**
     colormatch_loss_scale = 0 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
+
+    #@markdown **CLIP\Aesthetics Conditional Settings**
+    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
+    clip_loss_scale = 0 #@param {type:"number"}
+    aesthetics_loss_scale = 0 #@param {type:"number"}
+    cutn = 1 #@param {type:"number"}
+    cut_pow = 0.0001 #@param {type:"number"}
+
+    #@markdown **Other Conditional Settings**
+    init_mse_scale = 0 #@param {type:"number"}
+    blue_loss_scale = 0 #@param {type:"number"}
+    ignore_sat_scale = 0 #@param {type:"number"}
     
-    grad_threshold_type = 'dynamic' #@param ["dynamic", "static", "mean", "schedule"]
-    clamp_start = 0.2 #@param
-    clamp_stop = 0.01 #@param
-    clamp_grad_threshold = 0.2 #@param {type:"number"}
+    #@markdown **Conditional Gradient Settings**
     gradient_wrt = 'x0_pred' #@param ["x", "x0_pred"]
     gradient_add_to = 'both' #@param ["cond", "uncond", "both"]
     decode_method = 'linear' #@param ["autoencoder","linear"]
+    grad_threshold_type = 'dynamic' #@param ["dynamic", "static", "mean", "schedule"]
+    clamp_grad_threshold = 0.2 #@param {type:"number"}
+    clamp_start = 0.2 #@param
+    clamp_stop = 0.01 #@param
 
     #@markdown **Speed vs VRAM Settings**
     cond_uncond_sync = True #@param {type:"boolean"}
