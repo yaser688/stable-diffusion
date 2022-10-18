@@ -145,7 +145,7 @@ def load_model():
     logging.set_verbosity_error()
 
     model_config = "v1-inference.yaml" #@param ["custom","v1-inference.yaml"]
-    model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt", "robo-diffusion-v1.ckpt","wd-v1-3-float16.ckpt"]
+    model_checkpoint =  "wd-v1-3-float16.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt", "robo-diffusion-v1.ckpt","wd-v1-3-float16.ckpt"]
 
     custom_config_path = "" #@param {type:"string"}
     custom_checkpoint_path = "" #@param {type:"string"}
@@ -410,7 +410,7 @@ def DeforumAnimArgs():
 # !! {"metadata":{
 # !!   "id": "2ujwkGZTcGev"
 # !! }}
-clip_prompts = ['hyperdetailed matte illustration geometric pattern']
+clip_prompts = ['a beautiful portrait of a woman by Artgerm, trending on Artstation']
 
 prompts = [
     "a beautiful lake by Asher Brown Durand, trending on Artstation", # the first prompt I want
@@ -456,9 +456,9 @@ def DeforumArgs():
 
     #@markdown **Sampling Settings**
     seed = -1 #@param
-    sampler = 'klms' #@param ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral","plms", "ddim"]
-    steps = 50 #@param
-    scale = 7 #@param
+    sampler = 'euler_ancestral' #@param ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral","plms", "ddim"]
+    steps = 80 #@param
+    scale = 12 #@param
     ddim_eta = 0.0 #@param
     dynamic_threshold = None
     static_threshold = None   
@@ -476,7 +476,7 @@ def DeforumArgs():
     log_weighted_subprompts = False #@param {type:"boolean"}
 
     #@markdown **Batch Settings**
-    n_batch = 1 #@param
+    n_batch = 4 #@param
     batch_name = "StableFun" #@param {type:"string"}
     filename_format = "{timestring}_{index}_{prompt}.png" #@param ["{timestring}_{index}_{seed}.png","{timestring}_{index}_{prompt}.png"]
     seed_behavior = "iter" #@param ["iter","fixed","random"]
@@ -505,20 +505,22 @@ def DeforumArgs():
     #@markdown **Conditioning Settings**
     init_mse_scale = 0 #@param {type:"number"}
     blue_loss_scale = 0
+    ignore_sat_scale = 5 #@param 
 
-    clip_loss_scale = 0 #@param {type:"number"}
-    aesthetics_loss_scale = 8 #@param {type:"number"}
-    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16']
+    clip_loss_scale = 100 #@param {type:"number"}
+    aesthetics_loss_scale = 10 #@param {type:"number"}
+    clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
     cutn = 1 #@param {type:"number"}
     cut_pow = 0.0001 #@param {type:"number"}
 
     colormatch_loss_scale = 0 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
-    clamp_grad_threshold = 0.1 #@param {type:"number"}
-    ignore_sat_scale = 5 #@param 
-
-    grad_threshold_type = 'mean' #@param ["dynamic", "static", "mean"]
+    
+    grad_threshold_type = 'schedule' #@param ["dynamic", "static", "mean", "schedule"]
+    clamp_start = 0.10 #@param
+    clamp_stop = 0.01 #@param
+    clamp_grad_threshold = 0.2 #@param {type:"number"}
     gradient_wrt = 'x' #@param ["x", "x0_pred"]
     gradient_add_to = 'both' #@param ["cond", "uncond", "both"]
     decode_method = 'linear' #@param ["autoencoder","linear"]
