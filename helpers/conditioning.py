@@ -54,9 +54,9 @@ def make_clip_loss_fn(root, args):
         vals = vals + ['', '1'][len(vals):]
         return vals[0], float(vals[1])
 
-    def parse_clip_prompts(clip_prompts):
+    def parse_clip_prompts(clip_prompt):
         target_embeds, weights = [], []
-        for prompt in clip_prompts:
+        for prompt in clip_prompt:
             txt, weight = parse_prompt(prompt)
             target_embeds.append(root.clip_model.encode_text(clip.tokenize(txt).to(root.device)).float())
             weights.append(weight)
@@ -71,7 +71,7 @@ def make_clip_loss_fn(root, args):
                           std=[0.26862954, 0.26130258, 0.27577711])
 
     make_cutouts = MakeCutouts(clip_size, args.cutn, args.cut_pow)
-    target_embeds, weights = parse_clip_prompts(args.clip_prompts)
+    target_embeds, weights = parse_clip_prompts(args.clip_prompt)
 
     def clip_loss_fn(x, sigma, **kwargs):
         nonlocal target_embeds, weights, make_cutouts, normalize

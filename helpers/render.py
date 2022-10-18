@@ -65,6 +65,7 @@ def render_image_batch(args, prompts, root):
 
     for iprompt, prompt in enumerate(prompts):  
         args.prompt = prompt
+        args.clip_prompt = prompt
         print(f"Prompt {iprompt+1} of {len(prompts)}")
         print(f"{args.prompt}")
 
