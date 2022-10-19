@@ -43,11 +43,11 @@ python -m pip install -r requirements.txt
 python Deforum_Stable_Diffusion.py
 
 ```
-you have successfully installed deforum stable diffusion if the python file runs without any errors. if you get "out of memory" errors you can try installing xformers for your system (see either Windows Users or Linux Users below).
+you have successfully installed deforum stable diffusion if the python file runs without any errors. if you get "out of memory" errors you can try installing xformers for your system (see either Windows Users or Linux Users below)
 
 
 ## Running Deforum Stable Diffusion
-there are four ways to run deforum stable diffusion: locally with the .py file, locally with jupyter, locally through colab, and on colab severs.
+there are four ways to run deforum stable diffusion: locally with the .py file, locally with jupyter, locally through colab, and on colab severs
 
 ### Running Locally
 make sure the dsd conda environment is active:
@@ -55,7 +55,7 @@ make sure the dsd conda environment is active:
 conda activate dsd
 
 ```
-navigate to the stable-diffusion folder and run either the Deforum_Stable_Diffusion.py or the Deforum_Stable_Diffusion.ipynb. running the .py is the quickest and easiest way to check that your installation is working, however, it is not the best environment for tinkering with prompts and settings.
+navigate to the stable-diffusion folder and run either the Deforum_Stable_Diffusion.py or the Deforum_Stable_Diffusion.ipynb. running the .py is the quickest and easiest way to check that your installation is working, however, it is not the best environment for tinkering with prompts and settings
 ```
 python Deforum_Stable_Diffusion.py
 
@@ -77,17 +77,17 @@ make sure the dsd conda environment is active:
 conda activate dsd
 
 ```
-open google colab. file > upload notebook > select .ipynb file in the stable-diffusion folder. enable jupyter extension. note: you only need to run this cell one time.
+open google colab. file > upload notebook > select .ipynb file in the stable-diffusion folder. enable jupyter extension. note: you only need to run this cell one time
 ```
 jupyter serverextension enable --py jupyter_http_over_ws
 
 ```
-start server.
+start server
 ```
 jupyter notebook --NotebookApp.allow_origin='https://colab.research.google.com' --port=8888 --NotebookApp.port_retries=0
   
 ```
-copy paste url token.
+copy paste url token
 
 
 ### Colab Hosted Runtime
