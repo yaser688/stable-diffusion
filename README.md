@@ -10,35 +10,32 @@
     <a href="https://replicate.com/deforum/deforum_stable_diffusion"><img alt="Replicate" src="https://replicate.com/deforum/deforum_stable_diffusion/badge"></a>
 </p>
 
-## Getting Started
-1. make sure you have the latest nvidia drivers https://developer.nvidia.com/cuda-downloads
-2. install anaconda for managing python environments and packages https://www.anaconda.com/
-3. create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
-4. open a anaconda powershell (on Windows) or terminal (Linux)
-5. install git through anaconda:
+## Before You Start
+- make sure you have the latest nvidia drivers https://developer.nvidia.com/cuda-downloads
+- install anaconda for managing python environments and packages https://www.anaconda.com/
+- create a huggingface token which you will need for auto model download: https://huggingface.co/settings/tokens
+- install ffmpeg https://ffmpeg.org/download.html
+- install git for your system. you can install git with anaconda:
 ```
 conda install -c anaconda git -y
 
 ```
-6. clone the github repository:
-```
-git clone -b local-conditioning https://github.com/deforum/stable-diffusion.git
-cd stable-diffusion
 
-```
-7. create anaconda environment:
+## Getting Started
+1. open a anaconda powershell (on Windows) or terminal (Linux)
+2. create anaconda environment:
 ```
 conda create -n dsd python=3.9 -y
 conda activate dsd
 conda install pytorch cudatoolkit=11.6 torchvision torchaudio -c pytorch -c conda-forge -y
 
 ```
-8. install required packages:
+3. install required packages:
 ```
 python -m pip install -r requirements.txt
 
 ```
-9. check your installation by running the .py
+4. check your installation by running the .py
 ```
 python Deforum_Stable_Diffusion.py
 
