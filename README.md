@@ -22,7 +22,7 @@ conda install -c anaconda git -y
 ```
 
 ## Getting Started
-1. open a anaconda powershell (on Windows) or terminal (Linux)
+1. open anaconda powershell (on Windows) or terminal (Linux) and navigate to install location
 2. create anaconda environment:
 ```
 conda create -n dsd python=3.9 -y
