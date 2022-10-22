@@ -93,8 +93,9 @@ class CFGDenoiserWithGrad(CompVisDenoiser):
         # Add gradient to the image
         if self.gradient_wrt == 'x':
             x.copy_(x.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim))
-            cond_denoised = denoised.detach()
+            cond_denoised = inner_model(x, sigma, **kwargs)
         elif self.gradient_wrt == 'x0_pred':
+            x.copy_(x.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim))
             cond_denoised = denoised.detach() + total_cond_grad * k_utils.append_dims(sigma, x.ndim)
 
         return cond_denoised
