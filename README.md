@@ -31,7 +31,7 @@ cd stable-diffusion
 ```
 3. create anaconda environment:
 ```
-conda create -n dsd python=3.9 -y
+conda create -n dsd python=3.10 -y
 conda activate dsd
 conda install pytorch cudatoolkit=11.6 torchvision torchaudio -c pytorch -c conda-forge -y
 
