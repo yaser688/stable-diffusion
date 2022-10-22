@@ -513,7 +513,7 @@ def DeforumArgs():
     #@markdown **Exposure/Contrast Conditional Settings**
     mean_loss_scale = 0 #@param {type:"number"}
     var_loss_scale = 0 #@param {type:"number"}
-    exposure_loss_scale = 100 #@param {type:"number"}
+    exposure_loss_scale = 0 #@param {type:"number"}
     exposure_target = 0.5 #@param {type:"number"}
 
     #@markdown **Color Match Conditional Settings**
