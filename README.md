@@ -23,19 +23,25 @@ conda install -c anaconda git -y
 
 ## Getting Started
 1. open anaconda powershell (on Windows) or terminal (Linux) and navigate to install location
-2. create anaconda environment:
+2. clone the github repository:
+```
+git clone -b local https://github.com/deforum/stable-diffusion.git
+cd stable-diffusion
+
+```
+3. create anaconda environment:
 ```
 conda create -n dsd python=3.9 -y
 conda activate dsd
 conda install pytorch cudatoolkit=11.6 torchvision torchaudio -c pytorch -c conda-forge -y
 
 ```
-3. install required packages:
+4. install required packages:
 ```
 python -m pip install -r requirements.txt
 
 ```
-4. check your installation by running the .py
+5. check your installation by running the .py
 ```
 python Deforum_Stable_Diffusion.py
 
