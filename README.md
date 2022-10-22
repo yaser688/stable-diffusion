@@ -25,7 +25,7 @@ conda install -c anaconda git -y
 1. open anaconda powershell (on Windows) or terminal (Linux) and navigate to install location
 2. clone the github repository:
 ```
-git clone -b local https://github.com/deforum/stable-diffusion.git
+git clone -b local-conditioning https://github.com/deforum/stable-diffusion.git
 cd stable-diffusion
 
 ```
