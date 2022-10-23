@@ -168,7 +168,7 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, ddim_discretize='fill', verbose=False)
 
-    if args.colormatch_loss_scale != 0:
+    if args.colormatch_scale != 0:
         assert args.colormatch_image is not None, "If using color match loss, colormatch_image is needed"
         colormatch_image, _ = load_img(args.colormatch_image)
         colormatch_image = colormatch_image.to('cpu')
@@ -185,7 +185,7 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
     else:
         mse_loss_fn = None
 
-    if args.colormatch_loss_scale != 0:
+    if args.colormatch_scale != 0:
         _,_ = get_color_palette(root, args.colormatch_n_colors, colormatch_image, verbose=True) # display target color palette outside the latent space
         if args.decode_method == "linear":
             grad_img_shape = (int(args.W/args.f), int(args.H/args.f))
@@ -197,34 +197,34 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
                                                   colormatch_image, 
                                                   n_colors=args.colormatch_n_colors, 
                                                   img_shape=grad_img_shape,
-                                                  ignore_sat_scale=args.ignore_sat_scale)
+                                                  ignore_sat_weight=args.ignore_sat_weight)
     else:
         color_loss_fn = None
 
-    if args.clip_loss_scale != 0:
+    if args.clip_scale != 0:
         clip_loss_fn = make_clip_loss_fn(root, args)
     else:
         clip_loss_fn = None
 
-    if args.aesthetics_loss_scale != 0:
+    if args.aesthetics_scale != 0:
         aesthetics_loss_fn = make_aesthetics_loss_fn(root, args)
     else:
         aesthetics_loss_fn = None
 
-    if args.exposure_loss_scale != 0:
+    if args.exposure_scale != 0:
         exposure_loss_fn = exposure_loss(args.exposure_target)
     else:
         exposure_loss_fn = None
 
     loss_fns_scales = [
-        [clip_loss_fn,              args.clip_loss_scale],
-        [blue_loss_fn,              args.blue_loss_scale],
-        [mean_loss_fn,              args.mean_loss_scale],
-        [exposure_loss_fn,          args.exposure_loss_scale],
-        [var_loss_fn,               args.var_loss_scale],
+        [clip_loss_fn,              args.clip_scale],
+        [blue_loss_fn,              args.blue_scale],
+        [mean_loss_fn,              args.mean_scale],
+        [exposure_loss_fn,          args.exposure_scale],
+        [var_loss_fn,               args.var_scale],
         [mse_loss_fn,               args.init_mse_scale],
-        [color_loss_fn,             args.colormatch_loss_scale],
-        [aesthetics_loss_fn,        args.aesthetics_loss_scale]
+        [color_loss_fn,             args.colormatch_scale],
+        [aesthetics_loss_fn,        args.aesthetics_scale]
     ]
 
     callback = SamplerCallback(args=args,

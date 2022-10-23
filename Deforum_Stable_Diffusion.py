@@ -511,27 +511,27 @@ def DeforumArgs():
     mask_overlay_blur = 5 # {type:"number"}
 
     #@markdown **Exposure/Contrast Conditional Settings**
-    mean_loss_scale = 0 #@param {type:"number"}
-    var_loss_scale = 0 #@param {type:"number"}
-    exposure_loss_scale = 0 #@param {type:"number"}
+    mean_scale = 0 #@param {type:"number"}
+    var_scale = 0 #@param {type:"number"}
+    exposure_scale = 0 #@param {type:"number"}
     exposure_target = 0.5 #@param {type:"number"}
 
     #@markdown **Color Match Conditional Settings**
-    colormatch_loss_scale = 0 #@param {type:"number"}
+    colormatch_scale = 0 #@param {type:"number"}
     colormatch_image = "https://www.saasdesign.io/wp-content/uploads/2021/02/palette-3-min-980x588.png" #@param {type:"string"}
     colormatch_n_colors = 4 #@param {type:"number"}
-    ignore_sat_scale = 0 #@param {type:"number"}
+    ignore_sat_weight = 0 #@param {type:"number"}
 
     #@markdown **CLIP\Aesthetics Conditional Settings**
     clip_name = 'ViT-L/14' #@param ['ViT-L/14', 'ViT-L/14@336px', 'ViT-B/16', 'ViT-B/32']
-    clip_loss_scale = 0 #@param {type:"number"}
-    aesthetics_loss_scale = 0 #@param {type:"number"}
+    clip_scale = 0 #@param {type:"number"}
+    aesthetics_scale = 0 #@param {type:"number"}
     cutn = 1 #@param {type:"number"}
     cut_pow = 0.0001 #@param {type:"number"}
 
     #@markdown **Other Conditional Settings**
     init_mse_scale = 0 #@param {type:"number"}
-    blue_loss_scale = 0 #@param {type:"number"}
+    blue_scale = 0 #@param {type:"number"}
     
     #@markdown **Conditional Gradient Settings**
     gradient_wrt = 'x0_pred' #@param ["x", "x0_pred"]
@@ -579,9 +579,9 @@ root.output_path = output_path
 root.half_precision = True
 
 # Load clip model if using clip guidance
-if (args.clip_loss_scale > 0) or (args.aesthetics_loss_scale > 0):
+if (args.clip_scale > 0) or (args.aesthetics_scale > 0):
     root.clip_model = clip.load(args.clip_name, jit=False)[0].eval().requires_grad_(False).to(device)
-    if (args.aesthetics_loss_scale > 0):
+    if (args.aesthetics_scale > 0):
         root.aesthetics_model = load_aesthetics_model(args, root)
 
 if args.seed == -1:

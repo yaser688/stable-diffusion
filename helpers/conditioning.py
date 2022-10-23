@@ -144,11 +144,11 @@ def get_color_palette(root, n_colors, target, verbose=False):
     # color_list = color_list[color_indexes]
     return color_list, color_counts
 
-def make_rgb_color_match_loss(root, target, n_colors, ignore_sat_scale=None, img_shape=None, device='cuda:0'):
+def make_rgb_color_match_loss(root, target, n_colors, ignore_sat_weight=None, img_shape=None, device='cuda:0'):
     """
     target (tensor): Image sample (values from -1 to 1) to extract the color palette
     n_colors (int): Number of colors in the color palette
-    ignore_sat_scale (None or number>0): Scale to ignore color saturation in color comparison
+    ignore_sat_weight (None or number>0): Scale to ignore color saturation in color comparison
     img_shape (None or (int, int)): shape (width, height) of sample that the conditioning gradient is applied to, 
                                     if None then calculate target color distribution during gradient calculation 
                                     rather than once at the beginning
@@ -193,13 +193,13 @@ def make_rgb_color_match_loss(root, target, n_colors, ignore_sat_scale=None, img
             # Make a tensor of entirely one color
             color = color[None,:,None].repeat(1,1,x.shape[2]).unsqueeze(3).repeat(1,1,1,x.shape[3])
             # Get the color distances
-            if ignore_sat_scale is None:
+            if ignore_sat_weight is None:
                 # Simple color distance
                 color_distances = torch.linalg.norm(x - color,  dim=1)
             else:
                 # Color distance if the colors were saturated
                 # This is to make color comparison ignore shadows and highlights, for example
-                color_distances = torch.linalg.norm(adjust_saturation(x, ignore_sat_scale) - color,  dim=1)
+                color_distances = torch.linalg.norm(adjust_saturation(x, ignore_sat_weight) - color,  dim=1)
 
             all_color_norm_distances[ic] = color_distances
         all_color_norm_distances = torch.flatten(all_color_norm_distances,start_dim=2)
