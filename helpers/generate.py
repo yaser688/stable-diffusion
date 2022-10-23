@@ -177,7 +177,14 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
         colormatch_image = None
 
     # Loss functions
-    mse_loss_fn = make_mse_loss(init_image)
+    if args.init_mse_scale != 0:
+        if args.decode_method == "linear":
+            mse_loss_fn = make_mse_loss(model.linear_decode(model.get_first_stage_encoding(model.encode_first_stage(init_image.to(device)))))
+        else:
+            mse_loss_fn = make_mse_loss(init_image)
+    else:
+        mse_loss_fn = None
+
     if args.colormatch_loss_scale != 0:
         _,_ = get_color_palette(root, args.colormatch_n_colors, colormatch_image, verbose=True) # display target color palette outside the latent space
         if args.decode_method == "linear":
