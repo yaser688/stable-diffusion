@@ -157,7 +157,18 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
         mask = None
 
     assert not ( (args.use_mask and args.overlay_mask) and (args.init_sample is None and init_image is None)), "Need an init image when use_mask == True and overlay_mask == True"
-        
+
+    # Init MSE loss image
+    init_mse_image = None
+    if args.init_mse_scale and args.init_mse_image != None and args.init_mse_image != '':
+        init_mse_image, mask_image = load_img(args.init_mse_image,
+                                          shape=(args.W, args.H),
+                                          use_alpha_as_mask=args.use_alpha_as_mask)
+        init_mse_image = init_mse_image.to(root.device)
+        init_mse_image = repeat(init_mse_image, '1 ... -> b ...', b=batch_size)
+
+    assert not ( args.init_mse_scale != 0 and (args.init_mse_image is None or args.init_mse_image == '') ), "Need an init image when init_mse_scale != 0"
+
     t_enc = int((1.0-args.strength) * args.steps)
 
     # Noise schedule for the k-diffusion samplers (used for masking)
@@ -179,9 +190,9 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
     # Loss functions
     if args.init_mse_scale != 0:
         if args.decode_method == "linear":
-            mse_loss_fn = make_mse_loss(model.linear_decode(model.get_first_stage_encoding(model.encode_first_stage(init_image.to(device)))))
+            mse_loss_fn = make_mse_loss(root.model.linear_decode(root.model.get_first_stage_encoding(root.model.encode_first_stage(init_mse_image.to(root.device)))))
         else:
-            mse_loss_fn = make_mse_loss(init_image)
+            mse_loss_fn = make_mse_loss(init_mse_image)
     else:
         mse_loss_fn = None
 
