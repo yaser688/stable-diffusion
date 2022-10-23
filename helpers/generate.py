@@ -316,7 +316,7 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
                                                     img_original.shape, 
                                                     args.mask_contrast_adjust, 
                                                     args.mask_brightness_adjust,
-                                                    args.inver_mask)
+                                                    args.invert_mask)
                         mask_fullres = mask_fullres[:,:3,:,:]
                         mask_fullres = repeat(mask_fullres, '1 ... -> b ...', b=batch_size)
 
