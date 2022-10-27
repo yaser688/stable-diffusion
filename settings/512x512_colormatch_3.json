@@ -16,7 +16,7 @@
     "blue_scale": 0,
     "gradient_wrt": "x0_pred",
     "gradient_add_to": "both",
-    "decode_method": "autoencoder",
+    "decode_method": "linear",
     "grad_threshold_type": "dynamic",
     "clamp_grad_threshold": 0.2,
     "grad_inject_timing": null,
