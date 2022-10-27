@@ -8,7 +8,8 @@ def load_args(args_dict,anim_args_dict, custom_settings_file):
     else:
         with open(custom_settings_file, "r") as f:
             jdata = json.loads(f.read())
-            animation_prompts = jdata["prompts"]
+            if jdata.get("prompts") is not None:
+                animation_prompts = jdata["prompts"]
             for i, k in enumerate(args_dict):
                 if k in jdata:
                     args_dict[k] = jdata[k]

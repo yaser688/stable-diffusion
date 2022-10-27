@@ -543,6 +543,7 @@ def DeforumArgs():
     clamp_grad_threshold = 0.2 #@param {type:"number"}
     clamp_start = 0.2 #@param
     clamp_stop = 0.01 #@param
+    grad_inject_timing = None
 
     #@markdown **Speed vs VRAM Settings**
     cond_uncond_sync = True #@param {type:"boolean"}

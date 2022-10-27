@@ -19,7 +19,7 @@ from scipy.ndimage import gaussian_filter
 from .callback import SamplerCallback
 
 from .conditioning import exposure_loss, make_mse_loss, get_color_palette, make_clip_loss_fn
-from .conditioning import make_rgb_color_match_loss, blue_loss_fn, threshold_by, make_aesthetics_loss_fn, mean_loss_fn, var_loss_fn, exposure_loss
+from .conditioning import make_rgb_color_match_loss, blue_loss_fn, threshold_by, make_aesthetics_loss_fn, mean_loss_fn, var_loss_fn, exposure_loss, make_grad_time_fn
 from .model_wrap import CFGDenoiserWithGrad
 
 def add_noise(sample: torch.Tensor, noise_amt: float) -> torch.Tensor:
@@ -248,6 +248,8 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
 
     clamp_fn = threshold_by(threshold=args.clamp_grad_threshold, threshold_type=args.grad_threshold_type, clamp_schedule=args.clamp_schedule)
 
+    grad_inject_timing_fn = make_grad_time_fn(args.grad_inject_timing, model_wrap, args.steps)
+
     cfg_model = CFGDenoiserWithGrad(model_wrap, 
                                     loss_fns_scales, 
                                     clamp_fn, 
@@ -255,6 +257,8 @@ def generate(args, root, frame = 0, return_latent=False, return_sample=False, re
                                     args.gradient_add_to, 
                                     args.cond_uncond_sync,
                                     decode_method=args.decode_method,
+                                    grad_inject_timing_fn=grad_inject_timing_fn, # option to use grad in only a few of the steps
+                                    grad_consolidate_fn=None, # function to add grad to image fn(img, grad, sigma)
                                     verbose=False)
 
     results = []

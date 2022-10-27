@@ -260,3 +260,44 @@ def threshold_by(threshold, threshold_type, clamp_schedule):
       return scheduling
   else:
       raise Exception(f"Thresholding type {threshold_type} not supported")
+
+def make_grad_time_fn(grad_inject_timing, model, steps):
+    """
+    grad_inject_timing (int or list of ints or list of floats between 0.0 and 1.0): 
+        int: compute grad every grad_inject_timing steps
+        list of floats: compute grad on these decimal fraction steps (eg, [0.5, 1.0] for 50 steps would be at steps 25 and 50)
+        list of ints: compute grad on these steps
+    model (CompVisDenoiser)
+    steps (int): number of steps
+    """
+    all_sigmas = model.get_sigmas(steps)
+    target_sigmas = torch.empty([0], device=all_sigmas.device)
+
+    def grad_timing_fn(sigma):
+        is_conditioning_step = False
+        if sigma in target_sigmas:
+            is_conditioning_step = True
+        return is_conditioning_step
+
+    if grad_inject_timing is None:
+        grad_timing_fn = lambda sigma: True
+    elif isinstance(grad_inject_timing,int) and grad_inject_timing <= steps and grad_inject_timing > 0:
+        # Compute grad every nth step
+        target_sigma_list = [sigma for i,sigma in enumerate(all_sigmas) if (i+1) % grad_inject_timing == 0]
+        target_sigmas = torch.Tensor(target_sigma_list).to(all_sigmas.device)
+    elif all(isinstance(t,float) for t in grad_inject_timing) and all(t>=0.0 and t<=1.0 for t in grad_inject_timing):
+        # Compute grad on these steps (expressed as a decimal fraction between 0.0 and 1.0)
+        target_indices = [int(frac_step*steps) if frac_step < 1.0 else steps-1 for frac_step in grad_inject_timing]
+        target_sigma_list = [sigma for i,sigma in enumerate(all_sigmas) if i in target_indices]
+        target_sigmas = torch.Tensor(target_sigma_list).to(all_sigmas.device)
+    elif all(isinstance(t,int) for t in grad_inject_timing) and all(t>0 and t<=steps for t in grad_inject_timing):
+        # Compute grad on these steps
+        target_sigma_list = [sigma for i,sigma in enumerate(all_sigmas) if i+1 in grad_inject_timing]
+        target_sigmas = torch.Tensor(target_sigma_list).to(all_sigmas.device)
+
+    else:
+        raise Exception(f"Not a valid input: grad_inject_timing={grad_inject_timing}\n" +
+                        f"Must be an int, list of all ints (between step 1 and {steps}), or list of all floats between 0.0 and 1.0")
+
+    return grad_timing_fn
+    
