@@ -52,3 +52,44 @@ def sampler_fn(
 
     samples = sampler_map[args.sampler](**sampler_args)
     return samples
+
+
+def make_inject_timing_fn(inject_timing, model, steps):
+    """
+    inject_timing (int or list of ints or list of floats between 0.0 and 1.0): 
+        int: compute every inject_timing steps
+        list of floats: compute on these decimal fraction steps (eg, [0.5, 1.0] for 50 steps would be at steps 25 and 50)
+        list of ints: compute on these steps
+    model (CompVisDenoiser)
+    steps (int): number of steps
+    """
+    all_sigmas = model.get_sigmas(steps)
+    target_sigmas = torch.empty([0], device=all_sigmas.device)
+
+    def timing_fn(sigma):
+        is_conditioning_step = False
+        if sigma in target_sigmas:
+            is_conditioning_step = True
+        return is_conditioning_step
+
+    if inject_timing is None:
+        timing_fn = lambda sigma: True
+    elif isinstance(inject_timing,int) and inject_timing <= steps and inject_timing > 0:
+        # Compute every nth step
+        target_sigma_list = [sigma for i,sigma in enumerate(all_sigmas) if (i+1) % inject_timing == 0]
+        target_sigmas = torch.Tensor(target_sigma_list).to(all_sigmas.device)
+    elif all(isinstance(t,float) for t in inject_timing) and all(t>=0.0 and t<=1.0 for t in inject_timing):
+        # Compute on these steps (expressed as a decimal fraction between 0.0 and 1.0)
+        target_indices = [int(frac_step*steps) if frac_step < 1.0 else steps-1 for frac_step in inject_timing]
+        target_sigma_list = [sigma for i,sigma in enumerate(all_sigmas) if i in target_indices]
+        target_sigmas = torch.Tensor(target_sigma_list).to(all_sigmas.device)
+    elif all(isinstance(t,int) for t in inject_timing) and all(t>0 and t<=steps for t in inject_timing):
+        # Compute on these steps
+        target_sigma_list = [sigma for i,sigma in enumerate(all_sigmas) if i+1 in inject_timing]
+        target_sigmas = torch.Tensor(target_sigma_list).to(all_sigmas.device)
+
+    else:
+        raise Exception(f"Not a valid input: inject_timing={inject_timing}\n" +
+                        f"Must be an int, list of all ints (between step 1 and {steps}), or list of all floats between 0.0 and 1.0")
+
+    return timing_fn

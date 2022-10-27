@@ -566,7 +566,7 @@ args_dict = DeforumArgs()
 anim_args_dict = DeforumAnimArgs()
 
 if override_settings_with_file:
-    load_args(args_dict,anim_args_dict,custom_settings_file)
+    load_args(args_dict,anim_args_dict,custom_settings_file, verbose=False)
 
 root = SimpleNamespace(**root)
 args = SimpleNamespace(**args_dict)
